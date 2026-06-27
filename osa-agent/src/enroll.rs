@@ -23,13 +23,19 @@ const CERT_FILE: &str = "host.crt";
 const CA_FILE: &str = "ca.crt";
 const HOST_ID_FILE: &str = "host_id";
 
-/// The identity material an enrolled host persists.
+/// The identity material an enrolled host persists. Certs are stored PEM-encoded
+/// so the `ControlChannel` TLS layer can load them directly.
 pub struct Identity {
     pub host_id: String,
     /// PEM-encoded private key — written locally, never transmitted.
     pub key_pem: String,
-    pub cert_der: Vec<u8>,
-    pub ca_root_der: Vec<u8>,
+    pub cert_pem: String,
+    pub ca_root_pem: String,
+}
+
+/// Wrap DER certificate bytes in PEM.
+fn der_to_pem(der: Vec<u8>) -> String {
+    pem::encode(&pem::Pem::new("CERTIFICATE", der))
 }
 
 /// Run enrollment end-to-end: generate a keypair + CSR, call `Enroll`, and
@@ -69,8 +75,8 @@ pub async fn run(
     let identity = Identity {
         host_id: resp.host_id,
         key_pem: key.serialize_pem(),
-        cert_der: resp.cert,
-        ca_root_der: resp.ca_root,
+        cert_pem: der_to_pem(resp.cert),
+        ca_root_pem: der_to_pem(resp.ca_root),
     };
     persist(state_dir, &identity, force)?;
     Ok(identity.host_id)
@@ -102,8 +108,8 @@ pub fn persist(state_dir: &Path, id: &Identity, force: bool) -> anyhow::Result<(
         .with_context(|| format!("creating state dir {}", state_dir.display()))?;
     set_dir_owner_only(state_dir);
 
-    write_atomic(state_dir, CERT_FILE, &id.cert_der, None).context("writing cert")?;
-    write_atomic(state_dir, CA_FILE, &id.ca_root_der, None).context("writing CA root")?;
+    write_atomic(state_dir, CERT_FILE, id.cert_pem.as_bytes(), None).context("writing cert")?;
+    write_atomic(state_dir, CA_FILE, id.ca_root_pem.as_bytes(), None).context("writing CA root")?;
     write_atomic(state_dir, HOST_ID_FILE, id.host_id.as_bytes(), None)
         .context("writing host_id")?;
     // Key last (the commit marker), created 0600 atomically.
@@ -152,8 +158,8 @@ mod tests {
         Identity {
             host_id: "11111111-1111-4111-8111-111111111111".into(),
             key_pem: "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n".into(),
-            cert_der: vec![1, 2, 3],
-            ca_root_der: vec![4, 5, 6],
+            cert_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n".into(),
+            ca_root_pem: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n".into(),
         }
     }
 
@@ -166,8 +172,14 @@ mod tests {
             fs::read_to_string(dir.path().join(HOST_ID_FILE)).unwrap(),
             identity().host_id
         );
-        assert_eq!(fs::read(dir.path().join(CERT_FILE)).unwrap(), vec![1, 2, 3]);
-        assert_eq!(fs::read(dir.path().join(CA_FILE)).unwrap(), vec![4, 5, 6]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(CERT_FILE)).unwrap(),
+            identity().cert_pem
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(CA_FILE)).unwrap(),
+            identity().ca_root_pem
+        );
 
         #[cfg(unix)]
         {

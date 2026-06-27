@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod control_channel;
 mod enroll;
 
 #[derive(Parser)]
@@ -45,11 +46,17 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Run the agent: dial the broker and serve dispatched actions.
+    /// Run the agent: dial the broker outbound over mTLS and serve actions.
     Run {
-        /// Path to the agent config file.
-        #[arg(long, env = "OSA_AGENT_CONFIG", default_value = "/etc/osa/agent.toml")]
-        config: String,
+        /// Directory holding the enrolled identity.
+        #[arg(long, env = "OSA_STATE_DIR", default_value = "/var/lib/osa")]
+        state_dir: PathBuf,
+        /// Broker host (must match the broker certificate name).
+        #[arg(long, env = "OSA_BROKER_HOST", default_value = "localhost")]
+        broker_host: String,
+        /// Broker mTLS port.
+        #[arg(long, env = "OSA_BROKER_PORT", default_value_t = 8883)]
+        broker_port: u16,
     },
 }
 
@@ -63,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Process-wide rustls crypto provider used by the mTLS control channel.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Enroll {
@@ -74,8 +84,12 @@ async fn main() -> anyhow::Result<()> {
             let host_id = enroll::run(coordinator, token, &state_dir, force).await?;
             tracing::info!(%host_id, state_dir = %state_dir.display(), "enrolled");
         }
-        Command::Run { config } => {
-            tracing::info!(%config, "run: scaffold — not yet implemented");
+        Command::Run {
+            state_dir,
+            broker_host,
+            broker_port,
+        } => {
+            control_channel::run(&state_dir, &broker_host, broker_port).await?;
         }
     }
     Ok(())

@@ -21,9 +21,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::Parser;
 use osa_proto::v1::operator_server::OperatorServer;
 
+mod broker;
 mod ca;
 mod service;
 mod token;
@@ -53,6 +55,20 @@ struct Cli {
     /// gRPC operator API bind address.
     #[arg(long, env = "OSA_GRPC_BIND", default_value = "0.0.0.0:8443")]
     grpc_bind: String,
+
+    /// Embedded MQTT broker (mTLS) bind address.
+    #[arg(long, env = "OSA_MQTT_BIND", default_value = "0.0.0.0:8883")]
+    mqtt_bind: String,
+
+    /// DNS name(s) the broker's TLS certificate is valid for. Agents must reach
+    /// the broker by one of these names. Comma-separated.
+    #[arg(
+        long,
+        env = "OSA_BROKER_DNS",
+        default_value = "localhost",
+        value_delimiter = ','
+    )]
+    broker_dns: Vec<String>,
 }
 
 #[tokio::main]
@@ -65,15 +81,42 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Install the process-wide rustls crypto provider used by the broker's TLS.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let addr: SocketAddr = cli
         .grpc_bind
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --grpc-bind {:?}: {e}", cli.grpc_bind))?;
+    let mqtt_addr: SocketAddr = cli
+        .mqtt_bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --mqtt-bind {:?}: {e}", cli.mqtt_bind))?;
 
     // Initialize the embedded CA (AD-23). For now it is generated in-memory at
     // startup; persistence lands in a later story (#7).
     let ca = Arc::new(ca::EmbeddedCa::new(HOST_CERT_TTL)?);
+
+    // Stand up the embedded mTLS broker: issue its server cert from the CA (so an
+    // agent that pinned the CA root trusts it) and write the TLS material to a
+    // private temp dir the broker reads. `cert_dir` is held for the process life.
+    let cert_dir = tempfile::TempDir::new().context("creating broker cert dir")?;
+    let dns: Vec<&str> = cli.broker_dns.iter().map(String::as_str).collect();
+    let server_cert = ca.issue_server_cert(&dns)?;
+    std::fs::write(
+        cert_dir.path().join(broker::BROKER_CERT),
+        &server_cert.cert_pem,
+    )?;
+    write_secret(
+        &cert_dir.path().join(broker::BROKER_KEY),
+        &server_cert.key_pem,
+    )?;
+    std::fs::write(cert_dir.path().join(broker::CA_CERT), ca.ca_root_pem())?;
+    broker::spawn(mqtt_addr, cert_dir.path())?;
+    wait_until_listening(mqtt_addr).await?;
+    tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) listening");
+
     let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
     let operator = service::OperatorService::new(ca, tokens, DEFAULT_TOKEN_TTL);
 
@@ -87,4 +130,39 @@ async fn main() -> anyhow::Result<()> {
         .serve(addr)
         .await?;
     Ok(())
+}
+
+/// Write a secret file owner-only (0600) on Unix, created with that mode so the
+/// bytes never touch disk world-readable.
+fn write_secret(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Probe until the embedded broker accepts a TCP connection, so a bind failure
+/// surfaces at startup instead of as a silently dead control plane.
+async fn wait_until_listening(addr: SocketAddr) -> anyhow::Result<()> {
+    let probe = if addr.ip().is_unspecified() {
+        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())
+    } else {
+        addr
+    };
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(probe).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("embedded broker did not start listening on {addr}")
 }

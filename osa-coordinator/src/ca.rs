@@ -78,6 +78,52 @@ impl EmbeddedCa {
             .map(|_| ())
             .map_err(|e| PortError::Invalid(format!("invalid CSR: {e}")))
     }
+
+    /// PEM of the CA root certificate (for TLS trust stores).
+    pub fn ca_root_pem(&self) -> String {
+        self.issuer.pem()
+    }
+
+    /// Issue a short-lived **server** certificate (serverAuth) for the given DNS
+    /// names, signed by this CA. Used for the embedded broker's TLS so an agent
+    /// that pinned the CA root trusts the broker (AD-27).
+    pub fn issue_server_cert(&self, dns_names: &[&str]) -> Result<ServerCert, PortError> {
+        if dns_names.is_empty() {
+            return Err(PortError::Invalid(
+                "a server cert needs at least one DNS name".into(),
+            ));
+        }
+        let key = KeyPair::generate().map_err(|e| PortError::Backend(e.to_string()))?;
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        for name in dns_names {
+            let dns = Ia5String::try_from(*name).map_err(|e| PortError::Backend(e.to_string()))?;
+            params.subject_alt_names.push(SanType::DnsName(dns));
+        }
+        params
+            .distinguished_name
+            .push(DnType::CommonName, *dns_names.first().unwrap_or(&"broker"));
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - CLOCK_SKEW;
+        params.not_after = now + self.cert_ttl;
+
+        let issuer: &Issuer<'_, KeyPair> = &self.issuer;
+        let cert = params
+            .signed_by(&key, issuer)
+            .map_err(|e| PortError::Backend(format!("signing server cert: {e}")))?;
+        Ok(ServerCert {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        })
+    }
+}
+
+/// A signed server certificate and its private key, both PEM-encoded.
+pub struct ServerCert {
+    pub cert_pem: String,
+    pub key_pem: String,
 }
 
 #[async_trait]
