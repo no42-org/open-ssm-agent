@@ -49,6 +49,19 @@ service Operator {
   // spine (Epic 2, AD-18/AD-19).
   rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Renew an existing identity before its cert expires (AD-11/AD-28). No join
+  // token: the request is authenticated by the current cert + a CSR that proves
+  // possession of that identity's key.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+message RenewRequest {
+  bytes current_cert = 1; // the agent's current (CA-signed) cert, DER
+  bytes csr = 2;          // CSR for the new cert, using the SAME keypair
+}
+
+message RenewResponse {
+  bytes cert = 1; // freshly signed cert, same host_id (AD-10)
 }
 
 message MintTokenRequest {

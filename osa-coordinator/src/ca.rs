@@ -19,10 +19,11 @@ use osa_core::ports::{CertIssuer, PortError};
 use rcgen::string::Ia5String;
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, CertifiedIssuer, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
 };
 use rustls_pki_types::CertificateSigningRequestDer;
 use time::{Duration, OffsetDateTime};
+use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// Backdate `not_before` to tolerate modest clock skew between the coordinator
 /// and the relying parties that validate the issued certificate.
@@ -118,28 +119,15 @@ impl EmbeddedCa {
             key_pem: key.serialize_pem(),
         })
     }
-}
 
-/// A signed server certificate and its private key, both PEM-encoded.
-pub struct ServerCert {
-    pub cert_pem: String,
-    pub key_pem: String,
-}
-
-#[async_trait]
-impl CertIssuer for EmbeddedCa {
-    async fn sign(&self, host_id: HostId, csr: &[u8]) -> Result<Vec<u8>, PortError> {
-        // Parse + verify the CSR (rcgen validates the proof-of-possession
-        // signature). A malformed or wrongly-signed CSR is a caller error and is
-        // rejected here before anything is signed.
+    /// Shared issuance path for enrollment and renewal: build a client cert for
+    /// `host_id` from `csr`, discarding every CSR-supplied field except the
+    /// proven public key.
+    fn issue(&self, host_id: HostId, csr: &[u8]) -> Result<Vec<u8>, PortError> {
         let csr_der = CertificateSigningRequestDer::from(csr);
         let mut req = CertificateSigningRequestParams::from_der(&csr_der)
             .map_err(|e| PortError::Invalid(format!("invalid CSR: {e}")))?;
 
-        // Build the issued certificate from a *fresh* parameter set so that NO
-        // field the agent put in the CSR (subject DN, requested SAN, extensions,
-        // basic constraints, …) can influence the result. Only `req.public_key`
-        // — the key the agent proved possession of — is carried over.
         let san = Ia5String::try_from(host_san_uri(host_id))
             .map_err(|e| PortError::Backend(e.to_string()))?;
         let now = OffsetDateTime::now_utc();
@@ -161,12 +149,92 @@ impl CertIssuer for EmbeddedCa {
             .map_err(|e| PortError::Backend(format!("signing failed: {e}")))?;
         Ok(cert.der().to_vec())
     }
+
+    /// Renew an existing identity (AD-11/AD-28). Verifies `current_cert` was
+    /// issued by this CA, is currently valid, and that `csr` carries the **same
+    /// key** (so the CSR's proof-of-possession also proves the requester holds
+    /// the current identity), then reissues a fresh cert for the same `host_id`
+    /// — no join token.
+    pub fn renew(&self, current_cert: &[u8], csr: &[u8]) -> Result<Vec<u8>, PortError> {
+        let (_, cert) = X509Certificate::from_der(current_cert)
+            .map_err(|_| PortError::Invalid("malformed current certificate".into()))?;
+        let ca_der = self.ca_root_der();
+        let (_, ca) =
+            X509Certificate::from_der(&ca_der).map_err(|e| PortError::Backend(e.to_string()))?;
+        cert.verify_signature(Some(ca.public_key()))
+            .map_err(|_| PortError::Invalid("current cert was not issued by this CA".into()))?;
+        if !cert.validity().is_valid() {
+            return Err(PortError::Invalid(
+                "current cert is expired or not yet valid".into(),
+            ));
+        }
+        // TODO(story 1.8): refuse a revoked identity here.
+        let host_id = host_id_from_cert(&cert)?;
+
+        // `from_der` verifies the CSR's proof-of-possession signature. Requiring
+        // the CSR's public key to equal the current cert's key then means the
+        // requester proved possession of *this identity's* key — this equality is
+        // the renewal auth boundary (no token needed).
+        let der = CertificateSigningRequestDer::from(csr);
+        let req = CertificateSigningRequestParams::from_der(&der)
+            .map_err(|e| PortError::Invalid(format!("invalid CSR: {e}")))?;
+        if req.public_key.der_bytes() != cert.public_key().subject_public_key.data.as_ref() {
+            return Err(PortError::Invalid(
+                "CSR key does not match the current identity".into(),
+            ));
+        }
+        self.issue(host_id, csr)
+    }
+}
+
+/// Extract the `host_id` from a cert's `urn:osa:host:<uuid>` URI SAN.
+fn host_id_from_cert(cert: &X509Certificate) -> Result<HostId, PortError> {
+    let san = cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .ok_or_else(|| PortError::Invalid("current cert has no SAN".into()))?;
+    let uri = san
+        .value
+        .general_names
+        .iter()
+        .find_map(|gn| match gn {
+            GeneralName::URI(u) => Some(*u),
+            _ => None,
+        })
+        .ok_or_else(|| PortError::Invalid("current cert has no URI SAN".into()))?;
+    let uuid = uri
+        .strip_prefix("urn:osa:host:")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| PortError::Invalid("SAN is not a host identity".into()))?;
+    Ok(HostId(uuid))
+}
+
+/// A signed server certificate and its private key, both PEM-encoded.
+pub struct ServerCert {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+#[async_trait]
+impl CertIssuer for EmbeddedCa {
+    async fn sign(&self, host_id: HostId, csr: &[u8]) -> Result<Vec<u8>, PortError> {
+        self.issue(host_id, csr)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+
+    /// A CSR built with the given keypair (no overridden fields survive issuance).
+    fn csr_with_key(key: &KeyPair) -> Vec<u8> {
+        CertificateParams::default()
+            .serialize_request(key)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
 
     /// A CSR an agent might submit — deliberately requesting a hostile subject CN
     /// and SAN that the coordinator must discard.
@@ -260,6 +328,71 @@ mod tests {
     async fn rejects_non_positive_ttl() {
         assert!(matches!(
             EmbeddedCa::new(Duration::ZERO),
+            Err(PortError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn renew_reissues_for_the_same_host() {
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let host = HostId::new();
+        let cert0 = ca.issue(host, &csr_with_key(&key)).unwrap();
+
+        // Renew with a CSR using the SAME key — no token needed.
+        let cert1 = ca.renew(&cert0, &csr_with_key(&key)).unwrap();
+
+        let (_, c1) = X509Certificate::from_der(&cert1).unwrap();
+        // Same host_id SAN...
+        let san = c1.subject_alternative_name().unwrap().unwrap();
+        let uri = san
+            .value
+            .general_names
+            .iter()
+            .find_map(|gn| match gn {
+                GeneralName::URI(u) => Some(*u),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(uri, host_san_uri(host));
+        // ...and signed by this CA.
+        let ca_der = ca.ca_root_der();
+        let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
+        c1.verify_signature(Some(ca_cert.public_key())).unwrap();
+    }
+
+    #[test]
+    fn renew_rejects_a_csr_with_a_different_key() {
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert0 = ca.issue(HostId::new(), &csr_with_key(&key)).unwrap();
+        let other = KeyPair::generate().unwrap();
+        assert!(matches!(
+            ca.renew(&cert0, &csr_with_key(&other)),
+            Err(PortError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn renew_rejects_a_cert_from_another_ca() {
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let foreign_ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let foreign = foreign_ca
+            .issue(HostId::new(), &csr_with_key(&key))
+            .unwrap();
+        assert!(matches!(
+            ca.renew(&foreign, &csr_with_key(&key)),
+            Err(PortError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn renew_rejects_a_malformed_current_cert() {
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        assert!(matches!(
+            ca.renew(b"not a certificate", &csr_with_key(&key)),
             Err(PortError::Invalid(_))
         ));
     }

@@ -16,7 +16,9 @@ use std::time::Duration;
 use osa_core::HostId;
 use osa_core::ports::{CertIssuer, PortError};
 use osa_proto::v1::operator_server::Operator;
-use osa_proto::v1::{EnrollRequest, EnrollResponse, MintTokenRequest, MintTokenResponse};
+use osa_proto::v1::{
+    EnrollRequest, EnrollResponse, MintTokenRequest, MintTokenResponse, RenewRequest, RenewResponse,
+};
 use tonic::{Request, Response, Status};
 
 use crate::ca::EmbeddedCa;
@@ -95,6 +97,21 @@ impl Operator for OperatorService {
             cert,
             ca_root: self.ca.ca_root_der(),
         }))
+    }
+
+    async fn renew(
+        &self,
+        request: Request<RenewRequest>,
+    ) -> Result<Response<RenewResponse>, Status> {
+        let RenewRequest { current_cert, csr } = request.into_inner();
+        let cert = self.ca.renew(&current_cert, &csr).map_err(|e| match e {
+            PortError::Invalid(m) => Status::permission_denied(m),
+            other => {
+                tracing::error!(error = %other, "renewal failed");
+                Status::internal("certificate renewal failed")
+            }
+        })?;
+        Ok(Response::new(RenewResponse { cert }))
     }
 }
 
