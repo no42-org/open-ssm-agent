@@ -12,6 +12,7 @@
 
 pub mod domain;
 pub mod ports;
+pub mod seal;
 pub mod stream;
 pub mod topics;
 
