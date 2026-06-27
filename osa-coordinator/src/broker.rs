@@ -14,9 +14,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings, TlsConfig};
+use rumqttd::local::LinkRx;
+use rumqttd::{
+    Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
+};
+
+/// A host is considered to have come back online if its previous heartbeat was
+/// older than this (so transient gaps do not spam "online" logs).
+const ONLINE_AFTER_GAP: Duration = Duration::from_secs(90);
+/// Cap on tracked hosts, so the last-seen map cannot grow without bound from host
+/// churn or spoofed host_ids (before topic ACLs, story 1.7).
+const MAX_TRACKED_HOSTS: usize = 50_000;
 
 /// File names the broker reads its TLS material from, written under the cert dir.
 pub const BROKER_CERT: &str = "broker.crt";
@@ -64,7 +75,17 @@ pub fn spawn(addr: SocketAddr, cert_dir: &Path) -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // `Broker::new` spawns the router immediately, so an in-process link can be
+    // created now (before `start()`) to observe host heartbeats — no second TLS
+    // client or bridge cert needed.
     let mut broker = Broker::new(config);
+    let (mut link_tx, link_rx) = broker
+        .link("osa-coordinator-observer")
+        .context("creating broker observer link")?;
+    link_tx
+        .subscribe(osa_core::topics::HEARTBEAT_FILTER)
+        .context("subscribing to host heartbeats")?;
+
     std::thread::Builder::new()
         .name("osa-broker".to_string())
         .spawn(move || {
@@ -73,5 +94,101 @@ pub fn spawn(addr: SocketAddr, cert_dir: &Path) -> anyhow::Result<()> {
             }
         })
         .context("spawning broker thread")?;
+
+    std::thread::Builder::new()
+        .name("osa-observer".to_string())
+        .spawn(move || {
+            // Hold `link_tx` for the thread's life so the link stays registered.
+            let _link_tx = link_tx;
+            observe_heartbeats(link_rx);
+        })
+        .context("spawning heartbeat observer thread")?;
     Ok(())
+}
+
+/// Receive forwarded heartbeats and log each host's online transition (AD-9).
+/// The bounded last-seen map only dedups transitions; a queryable registry +
+/// offline detection land with the Postgres registry (Epic 2).
+fn observe_heartbeats(mut rx: LinkRx) {
+    let mut last_seen: HashMap<String, Instant> = HashMap::new();
+    loop {
+        match rx.recv() {
+            Ok(Some(Notification::Forward(fwd))) => {
+                let topic = String::from_utf8_lossy(&fwd.publish.topic);
+                // NOTE: until topic ACLs land (story 1.7) the broker does not bind a
+                // cert to its host_id subtree, so this signal is not yet
+                // authenticated against the publisher's identity.
+                if let Some(host_id) = osa_core::topics::host_id_from_heartbeat(&topic)
+                    && record_heartbeat(&mut last_seen, host_id, Instant::now(), MAX_TRACKED_HOSTS)
+                {
+                    tracing::info!(%host_id, "host online (heartbeat)");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "heartbeat observer stopped");
+                break;
+            }
+        }
+    }
+}
+
+/// Record a heartbeat and return whether it is a new "online" transition (first
+/// sight, or returning after `ONLINE_AFTER_GAP`). Prunes stale entries and caps
+/// the map at `cap` so it cannot grow without bound.
+fn record_heartbeat(
+    last_seen: &mut HashMap<String, Instant>,
+    host_id: &str,
+    now: Instant,
+    cap: usize,
+) -> bool {
+    // Forget hosts not seen within the online window — they are offline, and
+    // pruning them bounds the map to roughly the active fleet.
+    last_seen.retain(|_, t| now.saturating_duration_since(*t) <= ONLINE_AFTER_GAP);
+    if last_seen.contains_key(host_id) {
+        last_seen.insert(host_id.to_string(), now);
+        false
+    } else if last_seen.len() >= cap {
+        false // at capacity with fresh entries: refuse new host_ids (anti-DoS)
+    } else {
+        last_seen.insert(host_id.to_string(), now);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_heartbeat_is_online_then_quiet() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        assert!(record_heartbeat(&mut m, "a", t0, 10));
+        assert!(!record_heartbeat(
+            &mut m,
+            "a",
+            t0 + Duration::from_secs(1),
+            10
+        ));
+    }
+
+    #[test]
+    fn returns_online_after_a_gap() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        assert!(record_heartbeat(&mut m, "a", t0, 10));
+        let later = t0 + ONLINE_AFTER_GAP + Duration::from_secs(1);
+        assert!(record_heartbeat(&mut m, "a", later, 10));
+    }
+
+    #[test]
+    fn map_is_capped() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        assert!(record_heartbeat(&mut m, "a", t0, 2));
+        assert!(record_heartbeat(&mut m, "b", t0, 2));
+        assert!(!record_heartbeat(&mut m, "c", t0, 2));
+        assert_eq!(m.len(), 2);
+    }
 }

@@ -16,12 +16,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, Transport};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tokio::time::sleep;
 
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
+/// How often the agent publishes a liveness heartbeat (AD-9).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// A session must stay up at least this long before its disconnect resets the
 /// backoff — otherwise a connection that flaps right after connecting would
 /// reconnect in a tight loop.
@@ -82,6 +84,7 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
     let identity = load_identity(state_dir)?;
     let host_id = read_host_id(state_dir)?;
     let seed = stable_seed(&host_id);
+    let heartbeat_topic = osa_core::topics::heartbeat(&host_id);
     tracing::info!(%host_id, broker = %format!("{broker_host}:{broker_port}"), "control channel: dialing broker (mTLS, outbound-only)");
 
     let mut attempt = 0u32;
@@ -94,21 +97,35 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
             Some((identity.cert_pem.clone(), identity.key_pem.clone())),
             None,
         ));
-        // Keep the client bound so the connection stays open while the loop runs.
-        let (_client, mut eventloop) = AsyncClient::new(opts, 16);
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // Liveness semantics: after a stall, send one heartbeat, not a catch-up burst.
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut connected_at: Option<Instant> = None;
         loop {
-            match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                    connected_at = Some(Instant::now());
-                    ever_connected = true;
-                    tracing::info!(%host_id, "control channel: connected");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "control channel: disconnected");
-                    break;
+            tokio::select! {
+                // Drain the network first; a heartbeat tick only fires when the
+                // eventloop is otherwise idle. `EventLoop::poll` retains its state
+                // across calls, so dropping a pending poll here is safe.
+                biased;
+                event = eventloop.poll() => match event {
+                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                        connected_at = Some(Instant::now());
+                        ever_connected = true;
+                        tracing::info!(%host_id, "control channel: connected");
+                        publish_heartbeat(&client, &heartbeat_topic);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "control channel: disconnected");
+                        break;
+                    }
+                },
+                _ = heartbeat.tick() => {
+                    if connected_at.is_some() {
+                        publish_heartbeat(&client, &heartbeat_topic);
+                    }
                 }
             }
         }
@@ -132,6 +149,19 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
             "control channel: reconnecting after backoff"
         );
         sleep(wait).await;
+    }
+}
+
+/// Publish a liveness heartbeat. The payload is empty — presence is the signal;
+/// the AD-27 AEAD seal lands in a later story.
+///
+/// Non-blocking on purpose: `publish().await` would stall the eventloop if the
+/// request channel filled (only `poll()` drains it), so a full channel could
+/// deadlock the connection. A dropped heartbeat is harmless — the next one is
+/// 15 s away.
+fn publish_heartbeat(client: &AsyncClient, topic: &str) {
+    if let Err(e) = client.try_publish(topic, QoS::AtMostOnce, false, Vec::new()) {
+        tracing::warn!(error = %e, "heartbeat publish skipped");
     }
 }
 

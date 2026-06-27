@@ -12,5 +12,6 @@
 
 pub mod domain;
 pub mod ports;
+pub mod topics;
 
 pub use domain::{HostId, JobId, Sid};
