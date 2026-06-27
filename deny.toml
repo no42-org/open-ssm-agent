@@ -1,0 +1,30 @@
+# cargo-deny configuration — supply-chain quality gate.
+# Run locally with `cargo deny check`; CI runs the same in code-quality.yml.
+
+[advisories]
+# Fail on any RustSec security advisory affecting the dependency tree.
+# Advisory DB: https://github.com/rustsec/advisory-db
+
+[licenses]
+# Only these SPDX licenses are permitted — all permissive and MIT-compatible.
+# This is the exact set present in the current tree; when a new dependency
+# introduces a license not listed here, CI fails until it is reviewed and added.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "BSD-3-Clause",
+    "Zlib",
+]
+
+[bans]
+# Duplicate versions are common and not worth failing CI; surface them instead.
+multiple-versions = "warn"
+# Forbid `version = "*"` deps, but allow intra-workspace path deps.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Crates must come from crates.io (or the workspace); nothing unvetted.
+unknown-registry = "deny"
+unknown-git = "deny"

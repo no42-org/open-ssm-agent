@@ -20,3 +20,9 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+
+[package.metadata.cargo-machete]
+# Pre-wired for upcoming stories: osa-core/osa-proto carry the domain + IDL the
+# ControlChannel and capabilities will use. The scaffold entrypoint parks and
+# does not reference them yet.
+ignored = ["osa-core", "osa-proto"]

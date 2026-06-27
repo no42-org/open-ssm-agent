@@ -18,3 +18,8 @@ osa-proto.workspace = true
 tonic.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+
+[package.metadata.cargo-machete]
+# Pre-wired for upcoming stories: osa-core/osa-proto carry the domain + IDL, and
+# tonic is the gRPC client to the coordinator. Not referenced by the scaffold yet.
+ignored = ["osa-core", "osa-proto", "tonic"]
