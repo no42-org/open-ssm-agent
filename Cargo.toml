@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 authors = ["Ronny Trommer <ronny@no42.org>"]
-repository = "https://github.com/no42org/open-ssm-agent"
+repository = "https://github.com/no42-org/open-ssm-agent"
 
 [workspace.dependencies]
 # Internal crates (dependency direction enforced per AD-26: proto -> core -> adapters/bins).
