@@ -27,8 +27,3 @@ pem = "3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-
-[package.metadata.cargo-machete]
-# osa-core (domain types) is pre-wired for the upcoming ControlChannel/capability
-# stories; enroll already uses osa-proto.
-ignored = ["osa-core"]
