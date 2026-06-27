@@ -25,6 +25,7 @@ use anyhow::Context;
 use clap::Parser;
 use osa_proto::v1::operator_server::OperatorServer;
 
+mod auth;
 mod broker;
 mod ca;
 mod revocation;
@@ -70,6 +71,24 @@ struct Cli {
         value_delimiter = ','
     )]
     broker_dns: Vec<String>,
+
+    /// OIDC issuer (`iss`) operator JWTs must carry (AD-18). Enables operator
+    /// authentication; requires `--oidc-audience` and `--oidc-jwks` too.
+    #[arg(long, env = "OSA_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// OIDC audience (`aud`) operator JWTs must carry.
+    #[arg(long, env = "OSA_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
+
+    /// Path to the issuer's JWKS document (its public signing keys). v1 reads it
+    /// from disk; live fetch/refresh over HTTP lands in a later story.
+    #[arg(long, env = "OSA_OIDC_JWKS")]
+    oidc_jwks: Option<String>,
+
+    /// Clock-skew leeway, in seconds, applied to JWT `exp`/`nbf`.
+    #[arg(long, env = "OSA_OIDC_LEEWAY_SECS", default_value_t = 60)]
+    oidc_leeway_secs: u64,
 }
 
 #[tokio::main]
@@ -122,16 +141,67 @@ async fn main() -> anyhow::Result<()> {
     let revocations = Arc::new(revocation::RevocationRegistry::new());
     let operator = service::OperatorService::new(ca, tokens, revocations, DEFAULT_TOKEN_TTL);
 
-    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator gRPC (plaintext)");
-    tonic::transport::Server::builder()
-        // Bound per-request time and per-connection concurrency to blunt abuse of
-        // the (currently unauthenticated) enrollment surface until Epic 2.
+    let jwt_auth = build_operator_auth(&cli)?;
+
+    // Bound per-request time and per-connection concurrency to blunt abuse of the
+    // enrollment surface.
+    let mut server = tonic::transport::Server::builder()
         .timeout(Duration::from_secs(30))
-        .concurrency_limit_per_connection(64)
-        .add_service(OperatorServer::new(operator))
-        .serve(addr)
-        .await?;
+        .concurrency_limit_per_connection(64);
+
+    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator gRPC (plaintext)");
+    match jwt_auth {
+        Some(jwt_auth) => {
+            tracing::info!("operator authentication: OIDC/JWT required (AD-18)");
+            server
+                .add_service(OperatorServer::with_interceptor(operator, jwt_auth))
+                .serve(addr)
+                .await?;
+        }
+        None => {
+            tracing::warn!(
+                "operator API is UNAUTHENTICATED — set --oidc-issuer/--oidc-audience/--oidc-jwks to require operator JWTs"
+            );
+            server
+                .add_service(OperatorServer::new(operator))
+                .serve(addr)
+                .await?;
+        }
+    }
     Ok(())
+}
+
+/// Build the operator JWT interceptor from config, if OIDC is configured. The
+/// three OIDC flags are all-or-nothing: providing some but not all is a hard
+/// misconfiguration rather than a silent fallback to no auth.
+fn build_operator_auth(cli: &Cli) -> anyhow::Result<Option<auth::JwtAuth>> {
+    // A leeway large enough to swallow a token's whole lifetime would silently
+    // defeat `exp`/`nbf`; keep the clock-skew allowance small.
+    const MAX_LEEWAY_SECS: u64 = 300;
+    match (&cli.oidc_issuer, &cli.oidc_audience, &cli.oidc_jwks) {
+        (Some(issuer), Some(audience), Some(jwks_path)) => {
+            if issuer.trim().is_empty() || audience.trim().is_empty() {
+                anyhow::bail!("--oidc-issuer and --oidc-audience must be non-empty");
+            }
+            if cli.oidc_leeway_secs > MAX_LEEWAY_SECS {
+                anyhow::bail!("--oidc-leeway-secs must be <= {MAX_LEEWAY_SECS}");
+            }
+            let jwks = std::fs::read(jwks_path)
+                .with_context(|| format!("reading OIDC JWKS from {jwks_path}"))?;
+            let policy = osa_core::auth::ValidationPolicy {
+                issuer: issuer.clone(),
+                audience: audience.clone(),
+                leeway_secs: cli.oidc_leeway_secs,
+            };
+            let validator = osa_core::auth::JwtValidator::from_jwks_json(policy, &jwks)
+                .map_err(|e| anyhow::anyhow!("invalid OIDC JWKS: {e}"))?;
+            Ok(Some(auth::JwtAuth::new(Arc::new(validator))))
+        }
+        (None, None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "operator OIDC auth requires --oidc-issuer, --oidc-audience, and --oidc-jwks together"
+        ),
+    }
 }
 
 /// Write a secret file owner-only (0600) on Unix, created with that mode so the

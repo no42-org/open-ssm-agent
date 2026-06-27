@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osa_core::HostId;
+use osa_core::auth::Subject;
 use osa_core::ports::{CertIssuer, PortError};
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
@@ -56,6 +57,13 @@ impl Operator for OperatorService {
         &self,
         request: Request<MintTokenRequest>,
     ) -> Result<Response<MintTokenResponse>, Status> {
+        // The authenticated operator, bound by the auth interceptor (AD-18); the
+        // PDP (story 2.2) will authorize on it. `anonymous` only when the API runs
+        // without OIDC configured.
+        let operator = request
+            .extensions()
+            .get::<Subject>()
+            .map_or_else(|| "anonymous".to_string(), |s| s.0.clone());
         let ttl = match request.into_inner().ttl_seconds {
             0 => self.default_ttl,
             secs => Duration::from_secs(secs),
@@ -67,6 +75,7 @@ impl Operator for OperatorService {
                 Status::internal("token mint failed")
             }
         })?;
+        tracing::info!(operator = %operator, "minted join token");
         Ok(Response::new(MintTokenResponse {
             join_token,
             expires_at_unix,

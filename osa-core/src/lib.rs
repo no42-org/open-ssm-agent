@@ -10,6 +10,7 @@
 //! bin** (AD-26). It depends only on [`osa_proto`]. Wiring of concrete adapters
 //! happens in the bins via constructor injection.
 
+pub mod auth;
 pub mod domain;
 pub mod ports;
 pub mod seal;

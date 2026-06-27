@@ -17,6 +17,7 @@ osa-core.workspace = true
 osa-proto.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [package.metadata.cargo-machete]

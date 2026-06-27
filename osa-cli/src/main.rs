@@ -19,8 +19,26 @@ struct Cli {
     #[arg(long, env = "OSA_COORDINATOR", default_value = "http://localhost:8443")]
     coordinator: String,
 
+    /// Operator OIDC bearer token (JWT). Sent as `authorization: Bearer <token>`
+    /// when the coordinator requires operator auth (AD-18). Obtain it from your
+    /// OIDC provider; typically exported as `OSA_OPERATOR_TOKEN`.
+    #[arg(long, env = "OSA_OPERATOR_TOKEN")]
+    operator_token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Wrap a request message, attaching the operator bearer token (if set) as
+/// gRPC `authorization` metadata.
+fn authed<T>(msg: T, token: &Option<String>) -> anyhow::Result<tonic::Request<T>> {
+    let mut req = tonic::Request::new(msg);
+    if let Some(token) = token {
+        let value = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("operator token is not valid ASCII"))?;
+        req.metadata_mut().insert("authorization", value);
+    }
+    Ok(req)
 }
 
 #[derive(Subcommand)]
@@ -56,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
                 osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
                     .await?;
             let resp = client
-                .mint_token(osa_proto::v1::MintTokenRequest { ttl_seconds: 0 })
+                .mint_token(authed(
+                    osa_proto::v1::MintTokenRequest { ttl_seconds: 0 },
+                    &cli.operator_token,
+                )?)
                 .await?
                 .into_inner();
             println!("join token:     {}", resp.join_token);
@@ -67,9 +88,12 @@ async fn main() -> anyhow::Result<()> {
                 osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
                     .await?;
             client
-                .revoke(osa_proto::v1::RevokeRequest {
-                    host_id: host.clone(),
-                })
+                .revoke(authed(
+                    osa_proto::v1::RevokeRequest {
+                        host_id: host.clone(),
+                    },
+                    &cli.operator_token,
+                )?)
                 .await?;
             println!("revoked {host}");
         }
