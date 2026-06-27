@@ -53,7 +53,16 @@ service Operator {
   // token: the request is authenticated by the current cert + a CSR that proves
   // possession of that identity's key.
   rpc Renew(RenewRequest) returns (RenewResponse);
+  // Revoke a host identity (AD-28). The host can no longer renew, so its
+  // short-lived cert lapses within its TTL.
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
 }
+
+message RevokeRequest {
+  string host_id = 1; // identity to revoke (AD-10)
+}
+
+message RevokeResponse {}
 
 message RenewRequest {
   bytes current_cert = 1; // the agent's current (CA-signed) cert, DER

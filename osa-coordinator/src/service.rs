@@ -17,25 +17,34 @@ use osa_core::HostId;
 use osa_core::ports::{CertIssuer, PortError};
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
-    EnrollRequest, EnrollResponse, MintTokenRequest, MintTokenResponse, RenewRequest, RenewResponse,
+    EnrollRequest, EnrollResponse, MintTokenRequest, MintTokenResponse, RenewRequest,
+    RenewResponse, RevokeRequest, RevokeResponse,
 };
 use tonic::{Request, Response, Status};
 
 use crate::ca::EmbeddedCa;
+use crate::revocation::RevocationRegistry;
 use crate::token::{JoinTokenRegistry, MintError};
 
 /// Implements the `Operator` service over the embedded CA + token registry.
 pub struct OperatorService {
     ca: Arc<EmbeddedCa>,
     tokens: Arc<JoinTokenRegistry>,
+    revocations: Arc<RevocationRegistry>,
     default_ttl: Duration,
 }
 
 impl OperatorService {
-    pub fn new(ca: Arc<EmbeddedCa>, tokens: Arc<JoinTokenRegistry>, default_ttl: Duration) -> Self {
+    pub fn new(
+        ca: Arc<EmbeddedCa>,
+        tokens: Arc<JoinTokenRegistry>,
+        revocations: Arc<RevocationRegistry>,
+        default_ttl: Duration,
+    ) -> Self {
         Self {
             ca,
             tokens,
+            revocations,
             default_ttl,
         }
     }
@@ -104,14 +113,33 @@ impl Operator for OperatorService {
         request: Request<RenewRequest>,
     ) -> Result<Response<RenewResponse>, Status> {
         let RenewRequest { current_cert, csr } = request.into_inner();
-        let cert = self.ca.renew(&current_cert, &csr).map_err(|e| match e {
-            PortError::Invalid(m) => Status::permission_denied(m),
-            other => {
-                tracing::error!(error = %other, "renewal failed");
-                Status::internal("certificate renewal failed")
-            }
-        })?;
+        let cert = self
+            .ca
+            .renew(&current_cert, &csr, |h| self.revocations.is_revoked(h))
+            .map_err(|e| match e {
+                PortError::Invalid(m) => Status::permission_denied(m),
+                PortError::Denied => Status::permission_denied("identity revoked"),
+                other => {
+                    tracing::error!(error = %other, "renewal failed");
+                    Status::internal("certificate renewal failed")
+                }
+            })?;
         Ok(Response::new(RenewResponse { cert }))
+    }
+
+    async fn revoke(
+        &self,
+        request: Request<RevokeRequest>,
+    ) -> Result<Response<RevokeResponse>, Status> {
+        let host_id = request
+            .into_inner()
+            .host_id
+            .parse::<uuid::Uuid>()
+            .map(HostId)
+            .map_err(|_| Status::invalid_argument("host_id is not a UUID"))?;
+        self.revocations.revoke(host_id);
+        tracing::info!(host_id = %host_id.0, "host identity revoked");
+        Ok(Response::new(RevokeResponse {}))
     }
 }
 
@@ -124,7 +152,8 @@ mod tests {
     fn service() -> OperatorService {
         let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
         let tokens = Arc::new(JoinTokenRegistry::new(Duration::from_secs(3600)));
-        OperatorService::new(ca, tokens, Duration::from_secs(900))
+        let revocations = Arc::new(RevocationRegistry::new());
+        OperatorService::new(ca, tokens, revocations, Duration::from_secs(900))
     }
 
     fn csr() -> Vec<u8> {
@@ -217,5 +246,57 @@ mod tests {
             }))
             .await;
         assert!(ok.is_ok(), "valid CSR with the same token must enroll");
+    }
+
+    #[tokio::test]
+    async fn renew_is_denied_after_revocation() {
+        let svc = service();
+        let token = mint(&svc).await;
+        let key = KeyPair::generate().unwrap();
+        let csr_with = || {
+            CertificateParams::default()
+                .serialize_request(&key)
+                .unwrap()
+                .der()
+                .to_vec()
+        };
+
+        let resp = svc
+            .enroll(Request::new(EnrollRequest {
+                join_token: token,
+                csr: csr_with(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Revoke the freshly enrolled identity.
+        svc.revoke(Request::new(RevokeRequest {
+            host_id: resp.host_id,
+        }))
+        .await
+        .unwrap();
+
+        // A renewal with a valid cert + same-key CSR is now denied.
+        let err = svc
+            .renew(Request::new(RenewRequest {
+                current_cert: resp.cert,
+                csr: csr_with(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_a_non_uuid_host_id() {
+        let svc = service();
+        let err = svc
+            .revoke(Request::new(RevokeRequest {
+                host_id: "not-a-uuid".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

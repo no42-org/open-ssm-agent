@@ -40,6 +40,11 @@ enum Command {
         /// Target host_id.
         host: String,
     },
+    /// Revoke a host identity so it can no longer renew (AD-28).
+    Revoke {
+        /// Target host_id (UUID).
+        host: String,
+    },
 }
 
 #[tokio::main]
@@ -56,6 +61,17 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             println!("join token:     {}", resp.join_token);
             println!("expires (unix): {}", resp.expires_at_unix);
+        }
+        Command::Revoke { host } => {
+            let mut client =
+                osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
+                    .await?;
+            client
+                .revoke(osa_proto::v1::RevokeRequest {
+                    host_id: host.clone(),
+                })
+                .await?;
+            println!("revoked {host}");
         }
         Command::Exec { host, .. } => println!("exec on {host}: scaffold — not yet implemented"),
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
