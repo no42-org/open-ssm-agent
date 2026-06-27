@@ -24,6 +24,7 @@ rcgen = { version = "0.14.8", default-features = false, features = ["pem", "cryp
 rumqttc = "0.25.1"
 rustls = "0.23"
 pem = "3"
+x509-parser = { version = "0.18.1", features = ["verify"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

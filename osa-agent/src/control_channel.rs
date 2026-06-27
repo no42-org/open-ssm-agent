@@ -81,8 +81,9 @@ fn backoff(attempt: u32, seed: u64) -> Duration {
 /// reconnect with backoff on any failure. Returns only on an unrecoverable setup
 /// error (e.g. missing identity).
 pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyhow::Result<()> {
-    let identity = load_identity(state_dir)?;
+    // Fail fast if the host is not enrolled; the host_id is stable.
     let host_id = read_host_id(state_dir)?;
+    load_identity(state_dir)?;
     let seed = stable_seed(&host_id);
     let heartbeat_topic = osa_core::topics::heartbeat(&host_id);
     tracing::info!(%host_id, broker = %format!("{broker_host}:{broker_port}"), "control channel: dialing broker (mTLS, outbound-only)");
@@ -90,11 +91,14 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
     let mut attempt = 0u32;
     let mut ever_connected = false;
     loop {
+        // Re-read the identity each reconnect so a cert renewed on disk
+        // (renewal_loop) is adopted on the next connection.
+        let identity = load_identity(state_dir)?;
         let mut opts = MqttOptions::new(host_id.clone(), broker_host, broker_port);
         opts.set_keep_alive(KEEP_ALIVE);
         opts.set_transport(Transport::tls(
-            identity.ca_pem.clone(),
-            Some((identity.cert_pem.clone(), identity.key_pem.clone())),
+            identity.ca_pem,
+            Some((identity.cert_pem, identity.key_pem)),
             None,
         ));
         let (client, mut eventloop) = AsyncClient::new(opts, 16);

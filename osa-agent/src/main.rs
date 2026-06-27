@@ -51,12 +51,24 @@ enum Command {
         /// Directory holding the enrolled identity.
         #[arg(long, env = "OSA_STATE_DIR", default_value = "/var/lib/osa")]
         state_dir: PathBuf,
+        /// Coordinator gRPC endpoint (used for background cert renewal).
+        #[arg(long, env = "OSA_COORDINATOR", default_value = "http://localhost:8443")]
+        coordinator: String,
         /// Broker host (must match the broker certificate name).
         #[arg(long, env = "OSA_BROKER_HOST", default_value = "localhost")]
         broker_host: String,
         /// Broker mTLS port.
         #[arg(long, env = "OSA_BROKER_PORT", default_value_t = 8883)]
         broker_port: u16,
+    },
+    /// Renew the host certificate before it expires (AD-11/AD-28).
+    Renew {
+        /// Coordinator gRPC endpoint.
+        #[arg(long, env = "OSA_COORDINATOR", default_value = "http://localhost:8443")]
+        coordinator: String,
+        /// Directory holding the enrolled identity.
+        #[arg(long, env = "OSA_STATE_DIR", default_value = "/var/lib/osa")]
+        state_dir: PathBuf,
     },
 }
 
@@ -84,11 +96,21 @@ async fn main() -> anyhow::Result<()> {
             let host_id = enroll::run(coordinator, token, &state_dir, force).await?;
             tracing::info!(%host_id, state_dir = %state_dir.display(), "enrolled");
         }
+        Command::Renew {
+            coordinator,
+            state_dir,
+        } => {
+            enroll::renew(coordinator, &state_dir).await?;
+            tracing::info!(state_dir = %state_dir.display(), "certificate renewed");
+        }
         Command::Run {
             state_dir,
+            coordinator,
             broker_host,
             broker_port,
         } => {
+            // Renew the cert in the background as it nears expiry.
+            tokio::spawn(enroll::renewal_loop(coordinator, state_dir.clone()));
             control_channel::run(&state_dir, &broker_host, broker_port).await?;
         }
     }

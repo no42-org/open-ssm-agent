@@ -12,11 +12,19 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use osa_proto::v1::EnrollRequest;
 use osa_proto::v1::operator_client::OperatorClient;
+use osa_proto::v1::{EnrollRequest, RenewRequest};
+use tokio::time::sleep;
+use x509_parser::prelude::{FromDer, X509Certificate};
+
+/// Renew once the cert is within this window of its expiry.
+const RENEW_BEFORE: Duration = Duration::from_secs(8 * 3600);
+/// How often the renewal loop checks the cert's remaining lifetime.
+const RENEW_CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 
 const KEY_FILE: &str = "host.key";
 const CERT_FILE: &str = "host.crt";
@@ -149,6 +157,99 @@ fn set_dir_owner_only(dir: &Path) {
 
 #[cfg(not(unix))]
 fn set_dir_owner_only(_dir: &Path) {}
+
+/// Renew the host certificate over the coordinator's `Renew` RPC, reusing the
+/// existing keypair (so the CSR's proof-of-possession also proves the current
+/// identity — no join token). Persists the new cert, keeping the key.
+pub async fn renew(coordinator: String, state_dir: &Path) -> anyhow::Result<()> {
+    let key_pem = fs::read_to_string(state_dir.join(KEY_FILE))
+        .with_context(|| format!("reading {KEY_FILE} (is the host enrolled?)"))?;
+    let cert_pem = fs::read_to_string(state_dir.join(CERT_FILE))
+        .with_context(|| format!("reading {CERT_FILE}"))?;
+    let current_cert = pem::parse(cert_pem.as_bytes())
+        .context("parsing current cert")?
+        .into_contents();
+
+    // Reuse the existing key: the CSR's proof-of-possession then proves we hold
+    // the current identity's key.
+    let key = rcgen::KeyPair::from_pem(&key_pem).context("loading private key")?;
+    let csr = rcgen::CertificateParams::default()
+        .serialize_request(&key)
+        .context("building CSR")?
+        .der()
+        .to_vec();
+
+    let mut client = OperatorClient::connect(coordinator)
+        .await
+        .context("connecting to coordinator")?;
+    let resp = client
+        .renew(RenewRequest { current_cert, csr })
+        .await
+        .context("renew request failed")?
+        .into_inner();
+
+    // Never overwrite our identity with an unverified response: the new cert must
+    // chain to the CA we pinned at enrollment.
+    verify_chains_to_pinned_ca(state_dir, &resp.cert).context("validating renewed cert")?;
+    write_atomic(state_dir, CERT_FILE, der_to_pem(resp.cert).as_bytes(), None)
+        .context("writing renewed cert")
+}
+
+/// Verify a DER cert chains to the CA root pinned in the state dir.
+fn verify_chains_to_pinned_ca(state_dir: &Path, cert_der: &[u8]) -> anyhow::Result<()> {
+    let ca_pem = fs::read_to_string(state_dir.join(CA_FILE))?;
+    let ca_der = pem::parse(ca_pem.as_bytes())?.into_contents();
+    let (_, ca) =
+        X509Certificate::from_der(&ca_der).map_err(|_| anyhow::anyhow!("malformed pinned CA"))?;
+    let (_, leaf) = X509Certificate::from_der(cert_der)
+        .map_err(|_| anyhow::anyhow!("renewed cert is not valid X.509"))?;
+    leaf.verify_signature(Some(ca.public_key()))
+        .map_err(|_| anyhow::anyhow!("renewed cert does not chain to the pinned CA"))?;
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Unix-seconds expiry (`notAfter`) of the persisted host certificate.
+fn cert_expiry_unix(state_dir: &Path) -> anyhow::Result<i64> {
+    let cert_pem = fs::read_to_string(state_dir.join(CERT_FILE))?;
+    let der = pem::parse(cert_pem.as_bytes())?.into_contents();
+    let (_, cert) = X509Certificate::from_der(&der)
+        .map_err(|_| anyhow::anyhow!("malformed host certificate"))?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
+/// Background loop: renew the cert as it nears expiry. Runs alongside the control
+/// channel; a renewed cert is adopted on the next reconnect — the renewal RPC
+/// (separate gRPC) does not drop the live session.
+pub async fn renewal_loop(coordinator: String, state_dir: PathBuf) {
+    loop {
+        match cert_expiry_unix(&state_dir) {
+            Ok(not_after) => {
+                let now = unix_now();
+                if now >= not_after {
+                    // Already lapsed: renewal will be refused — re-enrollment is the
+                    // only recovery. Surfaced distinctly from a retryable failure.
+                    tracing::error!("host certificate has expired — re-enrollment required");
+                } else if not_after - now <= RENEW_BEFORE.as_secs() as i64 {
+                    match renew(coordinator.clone(), &state_dir).await {
+                        Ok(()) => tracing::info!("certificate renewed"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "certificate renewal failed — will retry")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "cannot read certificate expiry"),
+        }
+        sleep(RENEW_CHECK_EVERY).await;
+    }
+}
 
 #[cfg(test)]
 mod tests {

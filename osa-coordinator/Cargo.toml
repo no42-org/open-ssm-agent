@@ -31,8 +31,5 @@ getrandom = "0.4.3"
 rumqttd = { version = "0.20.0", features = ["verify-client-cert"] }
 rustls = "0.23"
 tempfile = "3.27.0"
-
-[dev-dependencies]
-uuid = { workspace = true, features = ["v4"] }
-# `verify` lets tests cryptographically confirm a leaf was signed by the CA root.
 x509-parser = { version = "0.18.1", features = ["verify"] }
+uuid.workspace = true
