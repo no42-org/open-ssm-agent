@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# AI tools
+_bmad-output/
+_bmad/
+openspec/
+.claude/skills/
+
+# Local env / editor
+.env
+.env.*
+.DS_Store

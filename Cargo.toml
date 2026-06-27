@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "osa-proto",
+    "osa-core",
+    "osa-agent",
+    "osa-coordinator",
+    "osa-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+authors = ["Ronny Trommer <ronny@no42.org>"]
+repository = "https://github.com/no42org/open-ssm-agent"
+
+[workspace.dependencies]
+# Internal crates (dependency direction enforced per AD-26: proto -> core -> adapters/bins).
+osa-proto = { path = "osa-proto" }
+osa-core = { path = "osa-core" }
+
+# Async runtime + transport (AD-1, AD-3, AD-5, AD-6).
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync", "process"] }
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+async-trait = "0.1"
+
+# Domain plumbing.
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Observability + CLI (AD-32).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+strip = true
+lto = "thin"

@@ -1,0 +1,56 @@
+/*
+ * Copyright 2026 Ronny Trommer <ronny@no42.org>
+ * SPDX-License-Identifier: MIT
+ */
+syntax = "proto3";
+
+// One IDL system-wide (AD-6): used at the operator edge (gRPC) and the agent
+// edge (protobuf bytes in the MQTT payload). NetBox is the sole JSON/REST
+// exception and is intentionally absent here.
+package osa.v1;
+
+// Envelope splits control vs stream (AD-7). Routing fields travel in cleartext
+// so the untrusted broker can route (AD-9, AD-27); `ciphertext` is the
+// end-to-end AES-256-GCM payload the broker can never read (AD-27).
+message Envelope {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_CONTROL = 1; // handshake, dispatch, job result, session open/close, ack
+    KIND_STREAM = 2;  // opaque PTY / port-forward bytes
+  }
+
+  string host_id = 1; // cleartext routing key (AD-9, AD-10)
+  string sid = 2;     // cleartext session id, empty for non-session control
+  uint64 seq = 3;     // cleartext monotonic sequence (AD-8); nonce source (AD-27)
+  Kind kind = 4;      // cleartext type discriminator (AD-7)
+  bytes ciphertext = 5; // AEAD-sealed payload (AD-27)
+}
+
+// Typed action descriptor (AD-12). The coordinator authorizes on this and
+// routes by it, but NEVER parses the capability payload. `run_as` lives here so
+// the PolicyEngine (AD-19) and the agent-local backstop (AD-20) can constrain
+// privilege; `params_hash` is over a canonical byte encoding (Conventions).
+message ActionDescriptor {
+  string kind = 1;       // "shell" | "exec" | "inventory" | "file" | "port-forward"
+  string target = 2;     // host_id
+  string run_as = 3;     // target unix user
+  bytes params_hash = 4; // canonical hash of the opaque params
+}
+
+// Operator-facing enrollment surface (AD-5, AD-25). The agent generates its
+// keypair locally and presents a short-TTL single-use join token + CSR; the
+// coordinator validates, assigns host_id, and returns a signed mTLS cert.
+service Operator {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {
+  string join_token = 1; // short-TTL, single-use (AD-25)
+  bytes csr = 2;         // agent-generated CSR; private key never leaves the host
+}
+
+message EnrollResponse {
+  string host_id = 1;  // coordinator-assigned UUIDv4 (AD-10)
+  bytes cert = 2;      // signed client cert, SAN = host_id (AD-11)
+  bytes ca_root = 3;   // pinned CA root delivered in the join bundle (AD-25)
+}

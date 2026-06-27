@@ -1,0 +1,22 @@
+[package]
+name = "osa-agent"
+description = "open-ssm-agent host agent: outbound-only ControlChannel, capabilities, vault, collectors, local backstop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "osa-agent"
+path = "src/main.rs"
+
+[dependencies]
+osa-core.workspace = true
+osa-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

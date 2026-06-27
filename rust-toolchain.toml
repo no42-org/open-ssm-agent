@@ -1,0 +1,6 @@
+[toolchain]
+# MSRV floor is 1.91 (AD-16), anticipating the NetBox adapter's toolchain
+# requirement; no current dependency needs it yet. Build/dev on stable.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

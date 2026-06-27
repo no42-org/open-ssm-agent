@@ -1,0 +1,17 @@
+[package]
+name = "osa-proto"
+description = "Shared protobuf contract for open-ssm-agent (AD-6): one IDL at both edges."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

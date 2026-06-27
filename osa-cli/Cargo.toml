@@ -1,0 +1,20 @@
+[package]
+name = "osa-cli"
+description = "open-ssm-agent operator CLI: the v1 client surface, gRPC to the coordinator (AD-5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "osa"
+path = "src/main.rs"
+
+[dependencies]
+osa-core.workspace = true
+osa-proto.workspace = true
+tonic.workspace = true
+clap.workspace = true
+anyhow.workspace = true

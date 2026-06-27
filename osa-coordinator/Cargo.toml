@@ -1,0 +1,23 @@
+[package]
+name = "osa-coordinator"
+description = "open-ssm-agent coordinator: gRPC operator API, broker bridge, registry/audit/policy, CertIssuer, NetBox InventorySink."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "osa-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+osa-core.workspace = true
+osa-proto.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
