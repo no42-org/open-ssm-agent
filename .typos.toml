@@ -1,0 +1,7 @@
+[default]
+# Test key material is base64/base64url, not prose — its random runs trip the
+# spell checker. Ignore PEM blocks and JWKS modulus values wherever they appear.
+extend-ignore-re = [
+    "(?s)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----",
+    "\"n\":\"[A-Za-z0-9_-]+\"",
+]
