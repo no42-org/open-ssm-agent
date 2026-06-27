@@ -4,6 +4,19 @@
 [advisories]
 # Fail on any RustSec security advisory affecting the dependency tree.
 # Advisory DB: https://github.com/rustsec/advisory-db
+#
+# Time-boxed ignores for advisories pinned by the mandated MQTT stack
+# (rumqttc 0.25 / rumqttd 0.20, both latest, depend on rustls-webpki ^0.102.8).
+# Tracked in issue #11 — remove once the brokers ship patched webpki. The
+# affected code paths (URI/wildcard name constraints, webpki CRL matching) are
+# NOT exercised by open-ssm-agent, so the practical impact is nil.
+ignore = [
+    "RUSTSEC-2026-0049", # webpki: CRL distribution-point matching (CRLs unused; default Deny policy)
+    "RUSTSEC-2026-0098", # webpki: URI name-constraints (name constraints unused)
+    "RUSTSEC-2026-0099", # webpki: wildcard name-constraints (name constraints unused)
+    "RUSTSEC-2026-0104", # webpki: panic parsing a CRL (we never parse CRLs)
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained (not a vulnerability)
+]
 
 [licenses]
 # Only these SPDX licenses are permitted — all permissive and MIT-compatible.
@@ -16,6 +29,8 @@ allow = [
     "BSD-3-Clause",
     "Zlib",
     "ISC", # ring (Apache-2.0 AND ISC) + untrusted; permissive, MIT-compatible
+    "CC0-1.0",    # public-domain dedication (e.g. notify/tiny-keccak deps)
+    "Unlicense",  # public domain; permissive
 ]
 
 [bans]
