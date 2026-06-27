@@ -768,7 +768,7 @@ dependencies = [
  "clap",
  "osa-core",
  "osa-proto",
- "tonic",
+ "tokio",
 ]
 
 [[package]]
@@ -778,6 +778,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "getrandom 0.4.3",
  "osa-core",
  "osa-proto",
  "rcgen",
@@ -787,6 +788,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-parser",
 ]
 

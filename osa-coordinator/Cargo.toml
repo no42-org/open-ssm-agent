@@ -25,12 +25,9 @@ rcgen = { version = "0.14.8", default-features = false, features = ["pem", "cryp
 rustls-pki-types = "1.14.1"
 time = "0.3.51"
 async-trait.workspace = true
+getrandom = "0.4.3"
 
 [dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }
 # `verify` lets tests cryptographically confirm a leaf was signed by the CA root.
 x509-parser = { version = "0.18.1", features = ["verify"] }
-
-[package.metadata.cargo-machete]
-# Pre-wired for upcoming stories: osa-proto carries the IDL and tonic serves the
-# operator gRPC API. Not referenced yet (osa-core is now used by the CA adapter).
-ignored = ["osa-proto", "tonic"]

@@ -69,6 +69,15 @@ impl EmbeddedCa {
     pub fn ca_root_der(&self) -> Vec<u8> {
         self.issuer.der().to_vec()
     }
+
+    /// Parse and verify a CSR without issuing a certificate. Enrollment uses this
+    /// to reject a malformed CSR *before* it burns a single-use join token.
+    pub fn validate_csr(&self, csr: &[u8]) -> Result<(), PortError> {
+        let der = CertificateSigningRequestDer::from(csr);
+        CertificateSigningRequestParams::from_der(&der)
+            .map(|_| ())
+            .map_err(|e| PortError::Invalid(format!("invalid CSR: {e}")))
+    }
 }
 
 #[async_trait]
