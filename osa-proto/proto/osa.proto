@@ -21,7 +21,10 @@ message Envelope {
 
   string host_id = 1; // cleartext routing key (AD-9, AD-10)
   string sid = 2;     // cleartext session id, empty for non-session control
-  uint64 seq = 3;     // cleartext monotonic sequence (AD-8); nonce source (AD-27)
+  uint64 seq = 3;     // cleartext monotonic sequence (AD-8); also the GCM nonce
+                      // counter under the per-session, per-direction key —
+                      // unique by construction, never seq-alone. See AD-27 and
+                      // docs/design/aead-nonce.md.
   Kind kind = 4;      // cleartext type discriminator (AD-7)
   bytes ciphertext = 5; // AEAD-sealed payload (AD-27)
 }
