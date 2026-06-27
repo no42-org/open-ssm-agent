@@ -15,3 +15,8 @@ tonic-prost.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
+
+[package.metadata.cargo-machete]
+# Consumed by the code generated from osa.proto via tonic::include_proto!,
+# which cargo-machete's source scan cannot see.
+ignored = ["prost", "tonic-prost"]

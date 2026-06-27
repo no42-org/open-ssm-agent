@@ -1,0 +1,81 @@
+# Copyright 2026 Ronny Trommer <ronny@no42.org>
+# SPDX-License-Identifier: MIT
+#
+# Code-quality gates that complement the core CI (fmt + clippy + test). Each job
+# is independent so a failure points straight at one dimension. Only the coverage
+# job compiles the workspace; the rest read manifests/lockfile/sources.
+
+name: Code Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Security advisories, license policy, banned crates, untrusted sources.
+  supply-chain:
+    name: supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+
+  # Dependencies declared in a Cargo.toml but never used (see ignored lists for
+  # the scaffold's intentionally pre-wired deps).
+  unused-deps:
+    name: unused deps (cargo-machete)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
+        with:
+          tool: cargo-machete
+      - name: cargo-machete
+        run: cargo machete
+
+  # Spelling in source, comments, and docs.
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: typos
+        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # v1.47.2
+
+  # Test coverage report. Informational for now (no threshold) — the scaffold has
+  # no test logic yet; add `--fail-under-lines N` once real tests land.
+  coverage:
+    name: coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Add llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
+        with:
+          tool: cargo-llvm-cov
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only

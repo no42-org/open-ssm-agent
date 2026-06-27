@@ -18,8 +18,8 @@ repository = "https://github.com/no42-org/open-ssm-agent"
 
 [workspace.dependencies]
 # Internal crates (dependency direction enforced per AD-26: proto -> core -> adapters/bins).
-osa-proto = { path = "osa-proto" }
-osa-core = { path = "osa-core" }
+osa-proto = { path = "osa-proto", version = "0.1.0" }
+osa-core = { path = "osa-core", version = "0.1.0" }
 
 # Async runtime + transport (AD-1, AD-3, AD-5, AD-6).
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync", "process"] }
