@@ -1,6 +1,6 @@
 # AEAD nonce construction (coordinator ↔ agent)
 
-- **Status:** proposed — operationalizes [AD-27] for implementation.
+- **Status:** primitive implemented in `osa-core::seal` (story 1.6); session-handshake wiring pending.
 - **Tracks:** [#2](https://github.com/no42-org/open-ssm-agent/issues/2)
 - **Scope:** the `Envelope.ciphertext` seal on the `ControlChannel`. Not yet
   implemented; this note is the spec the AEAD adapter must follow when it lands.
@@ -72,10 +72,16 @@ The receiver tracks the highest accepted `seq` per `(K_dir)` and rejects any
 `seq` ≤ it (AD-8 dedup), so a broker replay of a sealed frame is dropped before
 decryption is trusted.
 
+## Frozen in `osa-core::seal` (story 1.6)
+
+- Library `aes-gcm` (RustCrypto); KDF `HKDF-SHA256`; directional labels
+  `osa/v1 c2a` / `osa/v1 a2c`; nonce = `00000000‖seq_be64`.
+- Channel binding: both ephemeral X25519 public keys (canonically ordered) plus
+  the caller `binding` (cert DERs) are folded into the HKDF salt; a low-order
+  peer key is rejected.
+
 ## Deferred to implementation
 
-- AEAD library selection and the exact HKDF labels/salt (the `"osa/v1 …"` strings
-  above are placeholders to be frozen with the adapter).
 - The concrete rekey threshold values (message count / time).
 - Whether stream frames (PTY/port bytes) share the directional key with control
   frames or derive a third subkey.
