@@ -1,0 +1,43 @@
+# Copyright 2026 Ronny Trommer <ronny@no42.org>
+# SPDX-License-Identifier: MIT
+#
+# CI invokes Makefile targets, never the underlying tooling directly, so local
+# and CI commands stay in sync. The toolchain (channel + components + targets)
+# is pinned by rust-toolchain.toml; rustup installs it on first cargo call.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: build + verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # osa-proto codegen shells out to protoc (AD-6); it is a hard build dep.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build
+        run: make build
+
+      - name: Verify (fmt-check + clippy -D warnings + test)
+        run: make verify
