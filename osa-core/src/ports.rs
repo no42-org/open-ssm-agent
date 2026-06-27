@@ -24,6 +24,11 @@ pub enum PortError {
     Denied,
     #[error("not found")]
     NotFound,
+    /// Caller-supplied input was malformed or rejected at the boundary — a
+    /// permanent client-side error, distinct from a (possibly transient)
+    /// [`Backend`](Self::Backend) failure.
+    #[error("invalid input: {0}")]
+    Invalid(String),
     #[error("backend failure: {0}")]
     Backend(String),
 }

@@ -15,6 +15,7 @@ allow = [
     "Unicode-3.0",
     "BSD-3-Clause",
     "Zlib",
+    "ISC", # ring (Apache-2.0 AND ISC) + untrusted; permissive, MIT-compatible
 ]
 
 [bans]
