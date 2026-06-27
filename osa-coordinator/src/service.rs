@@ -14,12 +14,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use osa_core::HostId;
+use osa_core::audit::{AuditRecord, Decision};
 use osa_core::auth::Subject;
-use osa_core::ports::{CertIssuer, PolicyEngine, PortError};
+use osa_core::ports::{AuditLog, CertIssuer, PolicyEngine, PortError};
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
-    DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse, MintTokenRequest,
-    MintTokenResponse, RenewRequest, RenewResponse, RevokeRequest, RevokeResponse,
+    DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse, ExportAuditRequest,
+    ExportAuditResponse, MintTokenRequest, MintTokenResponse, RenewRequest, RenewResponse,
+    RevokeRequest, RevokeResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -33,6 +35,7 @@ pub struct OperatorService {
     tokens: Arc<JoinTokenRegistry>,
     revocations: Arc<RevocationRegistry>,
     policy: Arc<dyn PolicyEngine>,
+    audit: Arc<dyn AuditLog>,
     default_ttl: Duration,
 }
 
@@ -42,6 +45,7 @@ impl OperatorService {
         tokens: Arc<JoinTokenRegistry>,
         revocations: Arc<RevocationRegistry>,
         policy: Arc<dyn PolicyEngine>,
+        audit: Arc<dyn AuditLog>,
         default_ttl: Duration,
     ) -> Self {
         Self {
@@ -49,9 +53,18 @@ impl OperatorService {
             tokens,
             revocations,
             policy,
+            audit,
             default_ttl,
         }
     }
+}
+
+/// The current wall-clock as unix seconds, for audit timestamps.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tonic::async_trait]
@@ -174,23 +187,69 @@ impl Operator for OperatorService {
         }
 
         // The coordinator is the sole PDP (AD-19): authorize before any agent is
-        // contacted. Deny is the meaningful path for v1 (capabilities are stubbed).
-        self.policy
-            .authorize(&subject, &action)
+        // contacted. Both outcomes are auditable.
+        let decision = match self.policy.authorize(&subject, &action).await {
+            Ok(()) => Decision::Allow,
+            Err(PortError::Denied) => Decision::Deny,
+            Err(other) => {
+                tracing::error!(error = %other, "authorization failed");
+                return Err(Status::internal("authorization failed"));
+            }
+        };
+
+        // Record the decision (allowed AND denied, AD-21) before acting on it. A
+        // failure to write the audit log fails the dispatch closed — an
+        // unauditable action must not proceed.
+        self.audit
+            .append(AuditRecord {
+                ts_unix: now_unix(),
+                subject: subject.clone(),
+                kind: action.kind.clone(),
+                target: action.target.clone(),
+                run_as: action.run_as.clone(),
+                decision,
+            })
             .await
-            .map_err(|e| match e {
-                PortError::Denied => {
-                    tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch denied");
-                    Status::permission_denied("not authorized for this action")
-                }
-                other => {
-                    tracing::error!(error = %other, "authorization failed");
-                    Status::internal("authorization failed")
-                }
+            .map_err(|e| {
+                tracing::error!(error = %e, "audit append failed");
+                Status::internal("audit log unavailable")
             })?;
 
-        tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch authorized (execution stubbed until Epic 3)");
-        Ok(Response::new(DispatchResponse {}))
+        match decision {
+            Decision::Allow => {
+                tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch authorized (execution stubbed until Epic 3)");
+                Ok(Response::new(DispatchResponse {}))
+            }
+            Decision::Deny => {
+                tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch denied");
+                Err(Status::permission_denied("not authorized for this action"))
+            }
+        }
+    }
+
+    async fn export_audit(
+        &self,
+        _request: Request<ExportAuditRequest>,
+    ) -> Result<Response<ExportAuditResponse>, Status> {
+        let entries = self.audit.export().await.map_err(|e| {
+            tracing::error!(error = %e, "audit export failed");
+            Status::internal("audit log unavailable")
+        })?;
+        let entries = entries
+            .into_iter()
+            .map(|e| osa_proto::v1::AuditEntry {
+                seq: e.seq,
+                ts_unix: e.record.ts_unix,
+                subject: e.record.subject,
+                kind: e.record.kind,
+                target: e.record.target,
+                run_as: e.record.run_as,
+                decision: e.record.decision.as_str().to_string(),
+                prev_hash: e.prev_hash.to_vec(),
+                hash: e.hash.to_vec(),
+            })
+            .collect();
+        Ok(Response::new(ExportAuditResponse { entries }))
     }
 }
 
@@ -205,10 +264,21 @@ mod tests {
     }
 
     fn service_with_policy(policy: Arc<dyn PolicyEngine>) -> OperatorService {
+        service_with(policy, Arc::new(crate::audit_log::MemoryAuditLog::new()))
+    }
+
+    fn service_with(policy: Arc<dyn PolicyEngine>, audit: Arc<dyn AuditLog>) -> OperatorService {
         let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
         let tokens = Arc::new(JoinTokenRegistry::new(Duration::from_secs(3600)));
         let revocations = Arc::new(RevocationRegistry::new());
-        OperatorService::new(ca, tokens, revocations, policy, Duration::from_secs(900))
+        OperatorService::new(
+            ca,
+            tokens,
+            revocations,
+            policy,
+            audit,
+            Duration::from_secs(900),
+        )
     }
 
     /// A `DispatchRequest` for `kind` against `target`, carrying `subject` in the
@@ -439,6 +509,93 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn dispatch_audits_both_allow_and_deny() {
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["exec"]
+                selectors = ["*"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let audit = Arc::new(crate::audit_log::MemoryAuditLog::new());
+        let svc = service_with(policy, audit.clone());
+
+        // One allowed (alice/exec) and one denied (alice/shell) dispatch.
+        svc.dispatch(dispatch_req(Some("alice@example"), "exec", HOST))
+            .await
+            .unwrap();
+        let _ = svc
+            .dispatch(dispatch_req(Some("alice@example"), "shell", HOST))
+            .await;
+
+        let entries = audit.export().await.unwrap();
+        assert_eq!(entries.len(), 2, "both decisions must be audited");
+        assert_eq!(entries[0].record.decision, Decision::Allow);
+        assert_eq!(entries[1].record.decision, Decision::Deny);
+        assert_eq!(entries[1].record.subject, "alice@example");
+        // The chain the operator would export must verify.
+        osa_core::audit::verify(&entries, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_fails_closed_when_the_audit_log_is_unavailable() {
+        // An AuditLog that always fails: the dispatch must not proceed
+        // (unauditable action) and must surface Internal.
+        struct FailingAuditLog;
+        #[tonic::async_trait]
+        impl AuditLog for FailingAuditLog {
+            async fn append(&self, _r: AuditRecord) -> Result<(), PortError> {
+                Err(PortError::Backend("audit down".into()))
+            }
+            async fn export(&self) -> Result<Vec<osa_core::audit::AuditEntry>, PortError> {
+                Err(PortError::Backend("audit down".into()))
+            }
+        }
+        // Grant the action so the only failure is the audit write.
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["exec"]
+                selectors = ["*"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let svc = service_with(policy, Arc::new(FailingAuditLog));
+        let err = svc
+            .dispatch(dispatch_req(Some("alice@example"), "exec", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn export_audit_returns_the_verifiable_chain() {
+        let svc = service(); // deny-all policy
+        // Two denied dispatches still produce audit entries.
+        let _ = svc.dispatch(dispatch_req(Some("a@x"), "exec", HOST)).await;
+        let _ = svc.dispatch(dispatch_req(Some("b@x"), "exec", HOST)).await;
+
+        let resp = svc
+            .export_audit(Request::new(ExportAuditRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.entries.len(), 2);
+        assert_eq!(resp.entries[0].seq, 0);
+        assert_eq!(resp.entries[0].decision, "deny");
+        assert_eq!(resp.entries[0].hash.len(), 32);
+        // prev_hash of entry 1 chains to hash of entry 0.
+        assert_eq!(resp.entries[1].prev_hash, resp.entries[0].hash);
     }
 
     #[tokio::test]
