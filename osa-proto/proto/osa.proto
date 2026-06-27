@@ -44,7 +44,20 @@ message ActionDescriptor {
 // keypair locally and presents a short-TTL single-use join token + CSR; the
 // coordinator validates, assigns host_id, and returns a signed mTLS cert.
 service Operator {
+  // Mint a short-TTL single-use join token for a new host (AD-25). v1 leaves
+  // this unauthenticated; operator authn/authz is added in the enforcement
+  // spine (Epic 2, AD-18/AD-19).
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message MintTokenRequest {
+  uint64 ttl_seconds = 1; // requested validity; the coordinator may clamp it
+}
+
+message MintTokenResponse {
+  string join_token = 1;     // high-entropy single-use token
+  int64 expires_at_unix = 2; // absolute expiry, unix seconds
 }
 
 message EnrollRequest {

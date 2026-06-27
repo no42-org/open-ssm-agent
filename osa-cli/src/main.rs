@@ -14,12 +14,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "osa", version, about = "open-ssm-agent operator CLI")]
 struct Cli {
-    /// Coordinator gRPC endpoint.
-    #[arg(
-        long,
-        env = "OSA_COORDINATOR",
-        default_value = "https://localhost:8443"
-    )]
+    /// Coordinator gRPC endpoint. Plaintext (`http://`) for now; switches to
+    /// `https://` once the coordinator's TLS is wired (a later channel story).
+    #[arg(long, env = "OSA_COORDINATOR", default_value = "http://localhost:8443")]
     coordinator: String,
 
     #[command(subcommand)]
@@ -45,13 +42,21 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Token => println!(
-            "token: scaffold — not yet implemented ({})",
-            cli.coordinator
-        ),
+        Command::Token => {
+            let mut client =
+                osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
+                    .await?;
+            let resp = client
+                .mint_token(osa_proto::v1::MintTokenRequest { ttl_seconds: 0 })
+                .await?
+                .into_inner();
+            println!("join token:     {}", resp.join_token);
+            println!("expires (unix): {}", resp.expires_at_unix);
+        }
         Command::Exec { host, .. } => println!("exec on {host}: scaffold — not yet implemented"),
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
     }

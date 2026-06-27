@@ -15,11 +15,11 @@ path = "src/main.rs"
 [dependencies]
 osa-core.workspace = true
 osa-proto.workspace = true
-tonic.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [package.metadata.cargo-machete]
-# Pre-wired for upcoming stories: osa-core/osa-proto carry the domain + IDL, and
-# tonic is the gRPC client to the coordinator. Not referenced by the scaffold yet.
-ignored = ["osa-core", "osa-proto", "tonic"]
+# osa-core (domain types) is pre-wired for upcoming client stories; the `token`
+# command already uses osa-proto + tonic.
+ignored = ["osa-core"]
