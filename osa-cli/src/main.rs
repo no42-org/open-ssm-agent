@@ -97,7 +97,25 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("revoked {host}");
         }
-        Command::Exec { host, .. } => println!("exec on {host}: scaffold — not yet implemented"),
+        Command::Exec { host, .. } => {
+            let mut client =
+                osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
+                    .await?;
+            client
+                .dispatch(authed(
+                    osa_proto::v1::DispatchRequest {
+                        action: Some(osa_proto::v1::ActionDescriptor {
+                            kind: "exec".into(),
+                            target: host.clone(),
+                            run_as: String::new(),
+                            params_hash: Vec::new(),
+                        }),
+                    },
+                    &cli.operator_token,
+                )?)
+                .await?;
+            println!("dispatch accepted for {host} (execution lands in Epic 3)");
+        }
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
     }
     Ok(())

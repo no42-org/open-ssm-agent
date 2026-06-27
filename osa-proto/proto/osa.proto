@@ -56,7 +56,21 @@ service Operator {
   // Revoke a host identity (AD-28). The host can no longer renew, so its
   // short-lived cert lapses within its TTL.
   rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  // Dispatch a capability action against a target host (AD-12, AD-19). The
+  // coordinator authorizes the authenticated operator against the action via the
+  // PolicyEngine (deny-by-default RBAC) before any agent is contacted. An
+  // unauthorized dispatch is rejected PERMISSION_DENIED. v1 stubs the agent-side
+  // execution — capabilities land in Epic 3+.
+  rpc Dispatch(DispatchRequest) returns (DispatchResponse);
 }
+
+message DispatchRequest {
+  ActionDescriptor action = 1; // what to run, where, as whom (AD-12)
+}
+
+// Empty: reaching a response means the dispatch was authorized and accepted. A
+// denied dispatch is a PERMISSION_DENIED status, not a response.
+message DispatchResponse {}
 
 message RevokeRequest {
   string host_id = 1; // identity to revoke (AD-10)

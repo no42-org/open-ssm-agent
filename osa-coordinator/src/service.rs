@@ -15,11 +15,11 @@ use std::time::Duration;
 
 use osa_core::HostId;
 use osa_core::auth::Subject;
-use osa_core::ports::{CertIssuer, PortError};
+use osa_core::ports::{CertIssuer, PolicyEngine, PortError};
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
-    EnrollRequest, EnrollResponse, MintTokenRequest, MintTokenResponse, RenewRequest,
-    RenewResponse, RevokeRequest, RevokeResponse,
+    DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse, MintTokenRequest,
+    MintTokenResponse, RenewRequest, RenewResponse, RevokeRequest, RevokeResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -32,6 +32,7 @@ pub struct OperatorService {
     ca: Arc<EmbeddedCa>,
     tokens: Arc<JoinTokenRegistry>,
     revocations: Arc<RevocationRegistry>,
+    policy: Arc<dyn PolicyEngine>,
     default_ttl: Duration,
 }
 
@@ -40,12 +41,14 @@ impl OperatorService {
         ca: Arc<EmbeddedCa>,
         tokens: Arc<JoinTokenRegistry>,
         revocations: Arc<RevocationRegistry>,
+        policy: Arc<dyn PolicyEngine>,
         default_ttl: Duration,
     ) -> Self {
         Self {
             ca,
             tokens,
             revocations,
+            policy,
             default_ttl,
         }
     }
@@ -150,6 +153,45 @@ impl Operator for OperatorService {
         tracing::info!(host_id = %host_id.0, "host identity revoked");
         Ok(Response::new(RevokeResponse {}))
     }
+
+    async fn dispatch(
+        &self,
+        request: Request<DispatchRequest>,
+    ) -> Result<Response<DispatchResponse>, Status> {
+        // The authenticated operator (AD-18), bound by the auth interceptor.
+        // `anonymous` only when the API runs without OIDC — and deny-by-default
+        // means anonymous has no bindings, so it is denied below.
+        let subject = request.extensions().get::<Subject>().map_or_else(
+            || crate::policy::ANONYMOUS_SUBJECT.to_string(),
+            |s| s.0.clone(),
+        );
+        let action = request
+            .into_inner()
+            .action
+            .ok_or_else(|| Status::invalid_argument("missing action"))?;
+        if action.kind.is_empty() {
+            return Err(Status::invalid_argument("action kind is empty"));
+        }
+
+        // The coordinator is the sole PDP (AD-19): authorize before any agent is
+        // contacted. Deny is the meaningful path for v1 (capabilities are stubbed).
+        self.policy
+            .authorize(&subject, &action)
+            .await
+            .map_err(|e| match e {
+                PortError::Denied => {
+                    tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch denied");
+                    Status::permission_denied("not authorized for this action")
+                }
+                other => {
+                    tracing::error!(error = %other, "authorization failed");
+                    Status::internal("authorization failed")
+                }
+            })?;
+
+        tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch authorized (execution stubbed until Epic 3)");
+        Ok(Response::new(DispatchResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -159,10 +201,31 @@ mod tests {
     use x509_parser::prelude::{FromDer, X509Certificate};
 
     fn service() -> OperatorService {
+        service_with_policy(Arc::new(crate::policy::RbacPolicyEngine::empty()))
+    }
+
+    fn service_with_policy(policy: Arc<dyn PolicyEngine>) -> OperatorService {
         let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
         let tokens = Arc::new(JoinTokenRegistry::new(Duration::from_secs(3600)));
         let revocations = Arc::new(RevocationRegistry::new());
-        OperatorService::new(ca, tokens, revocations, Duration::from_secs(900))
+        OperatorService::new(ca, tokens, revocations, policy, Duration::from_secs(900))
+    }
+
+    /// A `DispatchRequest` for `kind` against `target`, carrying `subject` in the
+    /// request extensions the way the auth interceptor would.
+    fn dispatch_req(subject: Option<&str>, kind: &str, target: &str) -> Request<DispatchRequest> {
+        let mut req = Request::new(DispatchRequest {
+            action: Some(osa_proto::v1::ActionDescriptor {
+                kind: kind.into(),
+                target: target.into(),
+                run_as: String::new(),
+                params_hash: Vec::new(),
+            }),
+        });
+        if let Some(s) = subject {
+            req.extensions_mut().insert(Subject(s.to_string()));
+        }
+        req
     }
 
     fn csr() -> Vec<u8> {
@@ -295,6 +358,87 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    const HOST: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[tokio::test]
+    async fn dispatch_is_denied_by_default() {
+        // Deny-all policy: even an authenticated operator is rejected.
+        let svc = service();
+        let err = svc
+            .dispatch(dispatch_req(Some("alice@example"), "exec", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_allowed_by_a_matching_binding() {
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["exec"]
+                selectors = ["*"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let svc = service_with_policy(policy);
+        assert!(
+            svc.dispatch(dispatch_req(Some("alice@example"), "exec", HOST))
+                .await
+                .is_ok()
+        );
+        // A different verb the binding doesn't grant is still denied.
+        let err = svc
+            .dispatch(dispatch_req(Some("alice@example"), "shell", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn dispatch_without_a_subject_is_anonymous_and_denied() {
+        // No bound Subject (auth disabled) → "anonymous", which has no grants.
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["*"]
+                selectors = ["*"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let svc = service_with_policy(policy);
+        let err = svc
+            .dispatch(dispatch_req(None, "exec", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn dispatch_without_an_action_is_invalid() {
+        let svc = service();
+        let mut req = Request::new(DispatchRequest { action: None });
+        req.extensions_mut().insert(Subject("alice@example".into()));
+        let err = svc.dispatch(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_an_empty_kind_is_invalid() {
+        let svc = service();
+        let err = svc
+            .dispatch(dispatch_req(Some("alice@example"), "", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
