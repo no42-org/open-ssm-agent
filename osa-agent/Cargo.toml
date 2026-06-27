@@ -20,9 +20,12 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "crypto", "ring"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [package.metadata.cargo-machete]
-# Pre-wired for upcoming stories: osa-core/osa-proto carry the domain + IDL the
-# ControlChannel and capabilities will use. The scaffold entrypoint parks and
-# does not reference them yet.
-ignored = ["osa-core", "osa-proto"]
+# osa-core (domain types) is pre-wired for the upcoming ControlChannel/capability
+# stories; enroll already uses osa-proto.
+ignored = ["osa-core"]

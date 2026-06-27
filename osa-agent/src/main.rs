@@ -8,10 +8,14 @@
 //! Single-process `tokio` core that dials **outbound only** to the broker
 //! (never listens), wires the `ControlChannel` and capability adapters, and
 //! enforces the host-local backstop (AD-20). Interactive sessions run as
-//! isolated child processes (AD-14). This entrypoint is a scaffold: it wires
-//! config + logging and parks; adapters land in later stories.
+//! isolated child processes (AD-14). The `enroll` subcommand mints the host's
+//! identity (AD-11/AD-25); the `run` adapters land in later stories.
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+mod enroll;
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +38,12 @@ enum Command {
         /// Short-TTL single-use join token.
         #[arg(long, env = "OSA_JOIN_TOKEN")]
         token: String,
+        /// Directory the minted identity is persisted to.
+        #[arg(long, env = "OSA_STATE_DIR", default_value = "/var/lib/osa")]
+        state_dir: PathBuf,
+        /// Re-enroll even if an identity already exists.
+        #[arg(long)]
+        force: bool,
     },
     /// Run the agent: dial the broker and serve dispatched actions.
     Run {
@@ -55,8 +65,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Enroll { coordinator, .. } => {
-            tracing::info!(%coordinator, "enroll: scaffold — not yet implemented");
+        Command::Enroll {
+            coordinator,
+            token,
+            state_dir,
+            force,
+        } => {
+            let host_id = enroll::run(coordinator, token, &state_dir, force).await?;
+            tracing::info!(%host_id, state_dir = %state_dir.display(), "enrolled");
         }
         Command::Run { config } => {
             tracing::info!(%config, "run: scaffold — not yet implemented");
