@@ -27,6 +27,7 @@ use osa_proto::v1::operator_server::OperatorServer;
 
 mod broker;
 mod ca;
+mod revocation;
 mod service;
 mod token;
 
@@ -118,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) listening");
 
     let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
-    let operator = service::OperatorService::new(ca, tokens, DEFAULT_TOKEN_TTL);
+    let revocations = Arc::new(revocation::RevocationRegistry::new());
+    let operator = service::OperatorService::new(ca, tokens, revocations, DEFAULT_TOKEN_TTL);
 
     tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator gRPC (plaintext)");
     tonic::transport::Server::builder()
