@@ -8,8 +8,14 @@
 //! For v1 (tens of hosts) the broker embeds in the coordinator. It requires
 //! client certificates (mTLS): an agent presents the cert it was issued at
 //! enrollment, and the broker's own server cert is signed by the same embedded
-//! CA so an agent that pinned the CA root trusts it. Topic ACLs (AD-31) land in
-//! a later story; for now any cert signed by the CA may connect.
+//! CA so an agent that pinned the CA root trusts it.
+//!
+//! Per-cert topic ACLs (AD-31) are **not enforced**: `rumqttd 0.20` has no
+//! per-SAN topic authorization, so any cert signed by the CA may publish or
+//! subscribe to any topic (deferred — issue #16). The substantive attack
+//! (forging another host's content) is already blocked by the per-host AES-256
+//! GCM seal (AD-27, `osa-core::seal`); only spoofing of unsealed liveness
+//! remains, and that is low-severity.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -115,9 +121,10 @@ fn observe_heartbeats(mut rx: LinkRx) {
         match rx.recv() {
             Ok(Some(Notification::Forward(fwd))) => {
                 let topic = String::from_utf8_lossy(&fwd.publish.topic);
-                // NOTE: until topic ACLs land (story 1.7) the broker does not bind a
-                // cert to its host_id subtree, so this signal is not yet
-                // authenticated against the publisher's identity.
+                // NOTE: the broker enforces no per-cert topic ACL (issue #16), so
+                // this liveness signal is not authenticated against the publisher's
+                // identity. A host could spoof another's empty heartbeat; sealed
+                // payloads (AD-27) cannot be forged this way.
                 if let Some(host_id) = osa_core::topics::host_id_from_heartbeat(&topic)
                     && record_heartbeat(&mut last_seen, host_id, Instant::now(), MAX_TRACKED_HOSTS)
                 {
