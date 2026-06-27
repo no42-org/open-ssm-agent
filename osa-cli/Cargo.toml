@@ -19,8 +19,3 @@ clap.workspace = true
 anyhow.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-
-[package.metadata.cargo-machete]
-# osa-core (domain types) is pre-wired for upcoming client stories; the `token`
-# command already uses osa-proto + tonic.
-ignored = ["osa-core"]

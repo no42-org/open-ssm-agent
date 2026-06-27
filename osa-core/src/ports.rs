@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use osa_proto::v1::{ActionDescriptor, Envelope};
 
+use crate::audit::{AuditEntry, AuditRecord};
 use crate::domain::HostId;
 
 /// Errors crossing a port boundary. Adapters map their concrete failures onto
@@ -70,6 +71,19 @@ pub trait StreamCapability: Send + Sync {
 pub trait PolicyEngine: Send + Sync {
     /// Authorize `subject` to perform `action`. `Err(PortError::Denied)` denies.
     async fn authorize(&self, subject: &str, action: &ActionDescriptor) -> Result<(), PortError>;
+}
+
+/// Tamper-evident audit sink (AD-21). Records every dispatch decision as a
+/// hash-chained entry. The default adapter keeps the chain in memory; the
+/// Postgres-backed, cross-replica-serialized store is a later swap (AD-24). The
+/// chain logic lives in [`crate::audit`]; the adapter owns storage and the
+/// single-writer serialization that keeps the chain from forking.
+#[async_trait]
+pub trait AuditLog: Send + Sync {
+    /// Seal `record` onto the current chain head and persist it.
+    async fn append(&self, record: AuditRecord) -> Result<(), PortError>;
+    /// The full chain in order, for export / verification.
+    async fn export(&self) -> Result<Vec<AuditEntry>, PortError>;
 }
 
 /// PKI seam (AD-23). Default adapter is an embedded `rcgen` CA; `step-ca`/ACME

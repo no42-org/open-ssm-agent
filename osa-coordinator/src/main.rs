@@ -25,6 +25,7 @@ use anyhow::Context;
 use clap::Parser;
 use osa_proto::v1::operator_server::OperatorServer;
 
+mod audit_log;
 mod auth;
 mod broker;
 mod ca;
@@ -146,8 +147,10 @@ async fn main() -> anyhow::Result<()> {
     let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
     let revocations = Arc::new(revocation::RevocationRegistry::new());
     let policy = build_policy_engine(&cli)?;
+    // In-memory audit chain for v1; the durable, cross-replica store is story 2.3b.
+    let audit = Arc::new(audit_log::MemoryAuditLog::new());
     let operator =
-        service::OperatorService::new(ca, tokens, revocations, policy, DEFAULT_TOKEN_TTL);
+        service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);
 
     let jwt_auth = build_operator_auth(&cli)?;
 

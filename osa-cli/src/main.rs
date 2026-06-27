@@ -63,6 +63,23 @@ enum Command {
         /// Target host_id (UUID).
         host: String,
     },
+    /// Inspect the coordinator's tamper-evident audit log (AD-21).
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Export the audit chain and verify its integrity client-side.
+    Verify {
+        /// Hex-encoded last-known chain head (the `head:` line from a previous
+        /// run). If given, the chain must still end there — this is what detects
+        /// tail truncation or a rewrite of recent history (AD-21).
+        #[arg(long)]
+        expect_head: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +134,148 @@ async fn main() -> anyhow::Result<()> {
             println!("dispatch accepted for {host} (execution lands in Epic 3)");
         }
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
+        Command::Audit {
+            command: AuditCommand::Verify { expect_head },
+        } => {
+            let anchor = expect_head.as_deref().map(parse_head).transpose()?;
+            let mut client =
+                osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
+                    .await?;
+            let resp = client
+                .export_audit(authed(
+                    osa_proto::v1::ExportAuditRequest {},
+                    &cli.operator_token,
+                )?)
+                .await?
+                .into_inner();
+
+            // Recompute the chain locally rather than trusting a server verdict.
+            // NOTE: recomputing an unsigned chain proves only internal
+            // consistency. Detecting truncation/rewrite of recent history needs
+            // `--expect-head <hash>` (a head the operator recorded earlier);
+            // detecting a wholesale re-chain by a compromised coordinator needs a
+            // signed head (issue #24, lands with the durable store 2.3b).
+            let entries = resp
+                .entries
+                .iter()
+                .map(to_audit_entry)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let count = entries.len();
+            match osa_core::audit::verify(&entries, anchor) {
+                Ok(()) => {
+                    if count == 0 {
+                        println!("audit chain is EMPTY (0 entries)");
+                    } else {
+                        let head = to_hex(&entries[count - 1].hash);
+                        let anchored = if anchor.is_some() { ", anchored" } else { "" };
+                        println!("audit chain OK — {count} entries verified{anchored}");
+                        println!("head: {head}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("audit verification FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Lowercase-hex encode bytes.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Parse a 64-char hex string into a 32-byte chain head.
+fn parse_head(s: &str) -> anyhow::Result<[u8; 32]> {
+    let s = s.trim();
+    anyhow::ensure!(
+        s.len() == 64,
+        "--expect-head must be 64 hex chars (32 bytes)"
+    );
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
+            .map_err(|_| anyhow::anyhow!("--expect-head is not valid hex"))?;
+    }
+    Ok(out)
+}
+
+/// Convert one exported proto entry into the core type the verifier checks,
+/// validating the fixed-width hashes and the decision token.
+fn to_audit_entry(e: &osa_proto::v1::AuditEntry) -> anyhow::Result<osa_core::audit::AuditEntry> {
+    let hash32 = |b: &[u8], field: &str| -> anyhow::Result<[u8; 32]> {
+        <[u8; 32]>::try_from(b)
+            .map_err(|_| anyhow::anyhow!("audit entry {} has a malformed {field} hash", e.seq))
+    };
+    let decision = osa_core::audit::Decision::parse(&e.decision)
+        .ok_or_else(|| anyhow::anyhow!("audit entry {} has an unknown decision", e.seq))?;
+    Ok(osa_core::audit::AuditEntry {
+        seq: e.seq,
+        record: osa_core::audit::AuditRecord {
+            ts_unix: e.ts_unix,
+            subject: e.subject.clone(),
+            kind: e.kind.clone(),
+            target: e.target.clone(),
+            run_as: e.run_as.clone(),
+            decision,
+        },
+        prev_hash: hash32(&e.prev_hash, "prev_hash")?,
+        hash: hash32(&e.hash, "hash")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proto_entry() -> osa_proto::v1::AuditEntry {
+        osa_proto::v1::AuditEntry {
+            seq: 0,
+            ts_unix: 1_700_000_000,
+            subject: "alice".into(),
+            kind: "exec".into(),
+            target: "host".into(),
+            run_as: String::new(),
+            decision: "allow".into(),
+            prev_hash: vec![0u8; 32],
+            hash: vec![1u8; 32],
+        }
+    }
+
+    #[test]
+    fn to_audit_entry_accepts_a_well_formed_entry() {
+        assert!(to_audit_entry(&proto_entry()).is_ok());
+    }
+
+    #[test]
+    fn to_audit_entry_rejects_a_wrong_length_hash() {
+        let mut e = proto_entry();
+        e.hash = vec![1u8; 31]; // not 32 bytes
+        assert!(to_audit_entry(&e).is_err());
+    }
+
+    #[test]
+    fn to_audit_entry_rejects_an_unknown_decision() {
+        let mut e = proto_entry();
+        e.decision = "maybe".into();
+        assert!(to_audit_entry(&e).is_err());
+    }
+
+    #[test]
+    fn parse_head_round_trips_with_to_hex() {
+        let h = [0xabu8; 32];
+        assert_eq!(parse_head(&to_hex(&h)).unwrap(), h);
+    }
+
+    #[test]
+    fn parse_head_rejects_bad_input() {
+        assert!(parse_head("xyz").is_err()); // too short
+        assert!(parse_head(&"g".repeat(64)).is_err()); // not hex
+    }
 }

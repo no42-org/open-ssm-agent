@@ -62,6 +62,9 @@ service Operator {
   // unauthorized dispatch is rejected PERMISSION_DENIED. v1 stubs the agent-side
   // execution — capabilities land in Epic 3+.
   rpc Dispatch(DispatchRequest) returns (DispatchResponse);
+  // Export the append-only, hash-chained audit log (AD-21) for independent
+  // verification (`osa audit verify` recomputes the chain client-side).
+  rpc ExportAudit(ExportAuditRequest) returns (ExportAuditResponse);
 }
 
 message DispatchRequest {
@@ -71,6 +74,25 @@ message DispatchRequest {
 // Empty: reaching a response means the dispatch was authorized and accepted. A
 // denied dispatch is a PERMISSION_DENIED status, not a response.
 message DispatchResponse {}
+
+message ExportAuditRequest {}
+
+// One hash-chained audit entry (AD-21): hash = H(seq ‖ record ‖ prev_hash).
+message AuditEntry {
+  uint64 seq = 1;
+  int64 ts_unix = 2;
+  string subject = 3;
+  string kind = 4;
+  string target = 5;
+  string run_as = 6;
+  string decision = 7;   // "allow" | "deny"
+  bytes prev_hash = 8;   // 32-byte SHA-256 of the previous entry
+  bytes hash = 9;        // 32-byte SHA-256 of this entry
+}
+
+message ExportAuditResponse {
+  repeated AuditEntry entries = 1; // the full chain, seq-ordered
+}
 
 message RevokeRequest {
   string host_id = 1; // identity to revoke (AD-10)
