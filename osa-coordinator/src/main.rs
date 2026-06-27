@@ -28,6 +28,7 @@ use osa_proto::v1::operator_server::OperatorServer;
 mod auth;
 mod broker;
 mod ca;
+mod policy;
 mod revocation;
 mod service;
 mod token;
@@ -89,6 +90,11 @@ struct Cli {
     /// Clock-skew leeway, in seconds, applied to JWT `exp`/`nbf`.
     #[arg(long, env = "OSA_OIDC_LEEWAY_SECS", default_value_t = 60)]
     oidc_leeway_secs: u64,
+
+    /// Path to the RBAC policy document (TOML, AD-19). Without it the coordinator
+    /// denies every dispatch (deny-by-default).
+    #[arg(long, env = "OSA_RBAC_POLICY")]
+    rbac_policy: Option<String>,
 }
 
 #[tokio::main]
@@ -139,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
 
     let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
     let revocations = Arc::new(revocation::RevocationRegistry::new());
-    let operator = service::OperatorService::new(ca, tokens, revocations, DEFAULT_TOKEN_TTL);
+    let policy = build_policy_engine(&cli)?;
+    let operator =
+        service::OperatorService::new(ca, tokens, revocations, policy, DEFAULT_TOKEN_TTL);
 
     let jwt_auth = build_operator_auth(&cli)?;
 
@@ -169,6 +177,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the deny-by-default RBAC PDP (AD-19) from the policy file, or an
+/// empty (deny-all) engine if none is configured.
+fn build_policy_engine(cli: &Cli) -> anyhow::Result<Arc<dyn osa_core::ports::PolicyEngine>> {
+    match &cli.rbac_policy {
+        Some(path) => {
+            let doc = std::fs::read_to_string(path)
+                .with_context(|| format!("reading RBAC policy {path}"))?;
+            let engine = policy::RbacPolicyEngine::from_toml(&doc)?;
+            if engine.is_empty() {
+                tracing::warn!(
+                    %path,
+                    "RBAC policy has no bindings — every dispatch is denied (deny-by-default)"
+                );
+            }
+            Ok(Arc::new(engine))
+        }
+        None => {
+            tracing::warn!(
+                "no --rbac-policy configured — every dispatch is denied (deny-by-default)"
+            );
+            Ok(Arc::new(policy::RbacPolicyEngine::empty()))
+        }
+    }
 }
 
 /// Build the operator JWT interceptor from config, if OIDC is configured. The
