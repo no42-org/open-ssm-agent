@@ -36,6 +36,8 @@ uuid.workspace = true
 serde.workspace = true
 # RBAC policy document (AD-19); operator-editable.
 toml = "0.8"
+# Live JWKS fetch over HTTPS (AD-18, story 2.1b). rustls only — no OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 # Mint operator JWTs in the interceptor test (same crate osa-core validates with).

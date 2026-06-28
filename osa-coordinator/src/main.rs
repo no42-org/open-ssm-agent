@@ -29,6 +29,7 @@ mod audit_log;
 mod auth;
 mod broker;
 mod ca;
+mod jwks;
 mod policy;
 mod revocation;
 mod service;
@@ -83,10 +84,20 @@ struct Cli {
     #[arg(long, env = "OSA_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
 
-    /// Path to the issuer's JWKS document (its public signing keys). v1 reads it
-    /// from disk; live fetch/refresh over HTTP lands in a later story.
+    /// Path to a static JWKS document (the issuer's public signing keys), read
+    /// from disk at startup. Mutually exclusive with `--oidc-jwks-url`.
     #[arg(long, env = "OSA_OIDC_JWKS")]
     oidc_jwks: Option<String>,
+
+    /// URL of the issuer's JWKS endpoint. Keys are fetched live at startup and
+    /// re-fetched on an interval to pick up rotation. Mutually exclusive with
+    /// `--oidc-jwks`.
+    #[arg(long, env = "OSA_OIDC_JWKS_URL")]
+    oidc_jwks_url: Option<String>,
+
+    /// How often (seconds) to re-fetch a live JWKS for key rotation.
+    #[arg(long, env = "OSA_OIDC_REFRESH_SECS", default_value_t = 300)]
+    oidc_refresh_secs: u64,
 
     /// Clock-skew leeway, in seconds, applied to JWT `exp`/`nbf`.
     #[arg(long, env = "OSA_OIDC_LEEWAY_SECS", default_value_t = 60)]
@@ -152,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     let operator =
         service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);
 
-    let jwt_auth = build_operator_auth(&cli)?;
+    let jwt_auth = build_operator_auth(&cli).await?;
 
     // Bound per-request time and per-connection concurrency to blunt abuse of the
     // enrollment surface.
@@ -207,36 +218,77 @@ fn build_policy_engine(cli: &Cli) -> anyhow::Result<Arc<dyn osa_core::ports::Pol
     }
 }
 
-/// Build the operator JWT interceptor from config, if OIDC is configured. The
-/// three OIDC flags are all-or-nothing: providing some but not all is a hard
-/// misconfiguration rather than a silent fallback to no auth.
-fn build_operator_auth(cli: &Cli) -> anyhow::Result<Option<auth::JwtAuth>> {
+/// Build the operator JWT interceptor from config, if OIDC is configured.
+///
+/// `--oidc-issuer` + `--oidc-audience` enable auth and require exactly one key
+/// source — `--oidc-jwks <file>` (static) or `--oidc-jwks-url <url>` (live,
+/// auto-refreshed). Anything partial is a hard misconfiguration, never a silent
+/// fallback to no auth.
+async fn build_operator_auth(cli: &Cli) -> anyhow::Result<Option<auth::JwtAuth>> {
     // A leeway large enough to swallow a token's whole lifetime would silently
     // defeat `exp`/`nbf`; keep the clock-skew allowance small.
     const MAX_LEEWAY_SECS: u64 = 300;
-    match (&cli.oidc_issuer, &cli.oidc_audience, &cli.oidc_jwks) {
-        (Some(issuer), Some(audience), Some(jwks_path)) => {
-            if issuer.trim().is_empty() || audience.trim().is_empty() {
-                anyhow::bail!("--oidc-issuer and --oidc-audience must be non-empty");
-            }
-            if cli.oidc_leeway_secs > MAX_LEEWAY_SECS {
-                anyhow::bail!("--oidc-leeway-secs must be <= {MAX_LEEWAY_SECS}");
-            }
-            let jwks = std::fs::read(jwks_path)
-                .with_context(|| format!("reading OIDC JWKS from {jwks_path}"))?;
-            let policy = osa_core::auth::ValidationPolicy {
+    match (&cli.oidc_issuer, &cli.oidc_audience) {
+        (Some(issuer), Some(audience)) => {
+            anyhow::ensure!(
+                !issuer.trim().is_empty() && !audience.trim().is_empty(),
+                "--oidc-issuer and --oidc-audience must be non-empty"
+            );
+            anyhow::ensure!(
+                cli.oidc_leeway_secs <= MAX_LEEWAY_SECS,
+                "--oidc-leeway-secs must be <= {MAX_LEEWAY_SECS}"
+            );
+            let config = jwks::OidcConfig {
                 issuer: issuer.clone(),
                 audience: audience.clone(),
                 leeway_secs: cli.oidc_leeway_secs,
             };
-            let validator = osa_core::auth::JwtValidator::from_jwks_json(policy, &jwks)
-                .map_err(|e| anyhow::anyhow!("invalid OIDC JWKS: {e}"))?;
-            Ok(Some(auth::JwtAuth::new(Arc::new(validator))))
+            match (&cli.oidc_jwks, &cli.oidc_jwks_url) {
+                (Some(path), None) => {
+                    anyhow::ensure!(!path.trim().is_empty(), "--oidc-jwks must not be empty");
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("reading OIDC JWKS from {path}"))?;
+                    let validator =
+                        osa_core::auth::JwtValidator::from_jwks_json(config.policy(), &bytes)
+                            .map_err(|e| anyhow::anyhow!("invalid OIDC JWKS: {e}"))?;
+                    tracing::info!(%path, "operator JWKS loaded from file (static)");
+                    Ok(Some(auth::JwtAuth::new(Arc::new(validator))))
+                }
+                (None, Some(url)) => {
+                    anyhow::ensure!(
+                        cli.oidc_refresh_secs >= 1,
+                        "--oidc-refresh-secs must be >= 1"
+                    );
+                    // Enforce https (or loopback http) before the first fetch and
+                    // for every refresh — the key endpoint is the auth trust root.
+                    let url = jwks::validate_url(url)?;
+                    let validator = jwks::fetch_validator(&config, &url).await?;
+                    let jwt_auth = auth::JwtAuth::new(Arc::new(validator));
+                    jwks::spawn_refresh(
+                        jwt_auth.cell(),
+                        config,
+                        url.clone(),
+                        Duration::from_secs(cli.oidc_refresh_secs),
+                    );
+                    tracing::info!(%url, refresh_secs = cli.oidc_refresh_secs, "operator JWKS fetched live; key-rotation refresh enabled");
+                    Ok(Some(jwt_auth))
+                }
+                (None, None) => anyhow::bail!(
+                    "operator OIDC auth requires --oidc-jwks <file> or --oidc-jwks-url <url>"
+                ),
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("--oidc-jwks and --oidc-jwks-url are mutually exclusive")
+                }
+            }
         }
-        (None, None, None) => Ok(None),
-        _ => anyhow::bail!(
-            "operator OIDC auth requires --oidc-issuer, --oidc-audience, and --oidc-jwks together"
-        ),
+        (None, None) => {
+            anyhow::ensure!(
+                cli.oidc_jwks.is_none() && cli.oidc_jwks_url.is_none(),
+                "--oidc-jwks/--oidc-jwks-url require --oidc-issuer and --oidc-audience"
+            );
+            Ok(None)
+        }
+        _ => anyhow::bail!("--oidc-issuer and --oidc-audience must be set together"),
     }
 }
 
