@@ -31,6 +31,7 @@ allow = [
     "ISC", # ring (Apache-2.0 AND ISC) + untrusted; permissive, MIT-compatible
     "CC0-1.0",    # public-domain dedication (e.g. notify/tiny-keccak deps)
     "Unlicense",  # public domain; permissive
+    "CDLA-Permissive-2.0", # webpki-roots: Mozilla CA trust-root *data* (reqwest, live JWKS fetch); permissive, no copyleft
 ]
 
 [bans]

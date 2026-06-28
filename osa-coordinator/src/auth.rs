@@ -11,28 +11,47 @@
 //! into the request extensions for the handlers (and, later, the PDP) to read; on
 //! any failure the call is rejected `UNAUTHENTICATED` before it reaches a handler.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use osa_core::auth::{AuthError, JwtValidator};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
-/// A cloneable interceptor holding the shared validator.
+/// A hot-swappable validator cell. The interceptor reads the current validator;
+/// the JWKS refresh task (story 2.1b) swaps in a fresh one when the issuer
+/// rotates its keys, without dropping connections.
+pub type ValidatorCell = Arc<RwLock<Arc<JwtValidator>>>;
+
+/// A cloneable interceptor holding the shared, swappable validator.
 #[derive(Clone)]
 pub struct JwtAuth {
-    validator: Arc<JwtValidator>,
+    validator: ValidatorCell,
 }
 
 impl JwtAuth {
     pub fn new(validator: Arc<JwtValidator>) -> Self {
-        Self { validator }
+        Self {
+            validator: Arc::new(RwLock::new(validator)),
+        }
+    }
+
+    /// A handle to the validator cell, for a background refresher to swap keys.
+    pub fn cell(&self) -> ValidatorCell {
+        Arc::clone(&self.validator)
     }
 }
 
 impl Interceptor for JwtAuth {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         let token = bearer_token(&request)?;
-        match self.validator.validate(&token) {
+        // Snapshot the current validator (a cheap Arc clone) and release the lock
+        // before validating, so a concurrent key refresh never blocks a request.
+        let validator = self
+            .validator
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match validator.validate(&token) {
             Ok(subject) => {
                 request.extensions_mut().insert(subject);
                 Ok(request)
@@ -199,6 +218,31 @@ ycpRumeHZKJHtUrce7hTefI=
         let err = auth()
             .call(with_auth_header("Bearer not.a.jwt"))
             .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn swapping_the_validator_changes_outcomes() {
+        // The refresh task swaps the cell; the interceptor picks up the new
+        // validator on the next request without being recreated.
+        let auth = auth();
+        let header = format!("Bearer {}", valid_token());
+        assert!(auth.clone().call(with_auth_header(&header)).is_ok());
+
+        // Swap in a validator that expects a different issuer → the same token
+        // now fails against the freshly-installed keyset/policy.
+        let other = JwtValidator::from_jwks_json(
+            ValidationPolicy {
+                issuer: "https://rotated.example/".into(),
+                audience: "osa-coordinator".into(),
+                leeway_secs: 60,
+            },
+            TEST_JWKS.as_bytes(),
+        )
+        .unwrap();
+        *auth.cell().write().unwrap() = Arc::new(other);
+
+        let err = auth.clone().call(with_auth_header(&header)).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 }
