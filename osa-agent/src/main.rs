@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod backstop;
 mod control_channel;
 mod enroll;
 
@@ -60,6 +61,23 @@ enum Command {
         /// Broker mTLS port.
         #[arg(long, env = "OSA_BROKER_PORT", default_value_t = 8883)]
         broker_port: u16,
+        /// Path to the host-local allowlist (TOML, AD-20). Without it the agent
+        /// refuses every dispatched action (deny-by-default).
+        #[arg(long, env = "OSA_ALLOWLIST")]
+        allowlist: Option<PathBuf>,
+    },
+    /// Evaluate an action against the host-local allowlist (AD-20) without
+    /// running it — to validate an allowlist before deploying it.
+    Check {
+        /// Path to the host-local allowlist (TOML).
+        #[arg(long, env = "OSA_ALLOWLIST")]
+        allowlist: Option<PathBuf>,
+        /// Action kind / verb (e.g. `exec`).
+        #[arg(long)]
+        kind: String,
+        /// Target unix user; empty means the agent's default user.
+        #[arg(long, default_value = "")]
+        run_as: String,
     },
     /// Renew the host certificate before it expires (AD-11/AD-28).
     Renew {
@@ -108,10 +126,36 @@ async fn main() -> anyhow::Result<()> {
             coordinator,
             broker_host,
             broker_port,
+            allowlist,
         } => {
+            // Load the host backstop (AD-20) and announce it. The capability
+            // dispatcher (Epic 3) evaluates every dispatched action through it
+            // before any side effect; today the agent serves only heartbeats.
+            let backstop = backstop::load(allowlist.as_deref())?;
+            backstop::log_active(&backstop);
             // Renew the cert in the background as it nears expiry.
             tokio::spawn(enroll::renewal_loop(coordinator, state_dir.clone()));
             control_channel::run(&state_dir, &broker_host, broker_port).await?;
+        }
+        Command::Check {
+            allowlist,
+            kind,
+            run_as,
+        } => {
+            let backstop = backstop::load(allowlist.as_deref())?;
+            let action = osa_proto::v1::ActionDescriptor {
+                kind: kind.clone(),
+                target: String::new(),
+                run_as: run_as.clone(),
+                params_hash: Vec::new(),
+            };
+            match backstop.permits(&action) {
+                Ok(()) => println!("PERMITTED: kind={kind} run_as={run_as:?}"),
+                Err(denial) => {
+                    eprintln!("REFUSED: {denial}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
     Ok(())
