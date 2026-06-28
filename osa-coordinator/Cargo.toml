@@ -38,8 +38,13 @@ serde.workspace = true
 toml = "0.8"
 # Live JWKS fetch over HTTPS (AD-18, story 2.1b). rustls only — no OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Durable, stateless-over-Postgres store (AD-24, story 2.3b+). rustls; runtime-
+# checked queries (no build-time DB) + built-in migrator.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
 
 [dev-dependencies]
 # Mint operator JWTs in the interceptor test (same crate osa-core validates with).
 jsonwebtoken = "9.3"
 serde.workspace = true
+# Ephemeral Postgres for the durable-store integration tests (AD-24).
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
