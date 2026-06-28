@@ -16,6 +16,11 @@ ignore = [
     "RUSTSEC-2026-0099", # webpki: wildcard name-constraints (name constraints unused)
     "RUSTSEC-2026-0104", # webpki: panic parsing a CRL (we never parse CRLs)
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained (not a vulnerability)
+    # Dev-only: tokio-tar reaches the tree solely via testcontainers (a
+    # dev-dependency) and is NEVER in the shipped binary; it parses only our own
+    # Docker build-context tarballs in integration tests, never untrusted input.
+    # Tracked in issue #28 — remove once testcontainers drops tokio-tar 0.3.x.
+    "RUSTSEC-2025-0111", # tokio-tar PAX extended-header file smuggling (dev-only, trusted input)
 ]
 
 [licenses]

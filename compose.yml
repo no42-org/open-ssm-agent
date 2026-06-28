@@ -1,0 +1,25 @@
+# Copyright 2026 Ronny Trommer <ronny@no42.org>
+# SPDX-License-Identifier: MIT
+#
+# Local-dev Postgres for the coordinator (AD-24). Bring it up with
+# `docker compose up -d`, then run the coordinator with
+# `--database-url postgres://osa:osa@localhost:5432/osa`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: osa
+      POSTGRES_PASSWORD: osa
+      POSTGRES_DB: osa
+    ports:
+      - "5432:5432"
+    volumes:
+      - osa-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osa -d osa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  osa-pgdata:

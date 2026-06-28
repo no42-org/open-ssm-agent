@@ -29,6 +29,7 @@ mod audit_log;
 mod auth;
 mod broker;
 mod ca;
+mod db;
 mod jwks;
 mod policy;
 mod revocation;
@@ -107,6 +108,12 @@ struct Cli {
     /// denies every dispatch (deny-by-default).
     #[arg(long, env = "OSA_RBAC_POLICY")]
     rbac_policy: Option<String>,
+
+    /// Postgres connection URL (AD-24). When set, durable state (the audit log
+    /// now; tokens/revocation/CA with story 2.5) lives in Postgres and the
+    /// coordinator is stateless across replicas. Absent → in-memory single-node.
+    #[arg(long, env = "OSA_DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 #[tokio::main]
@@ -158,8 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
     let revocations = Arc::new(revocation::RevocationRegistry::new());
     let policy = build_policy_engine(&cli)?;
-    // In-memory audit chain for v1; the durable, cross-replica store is story 2.3b.
-    let audit = Arc::new(audit_log::MemoryAuditLog::new());
+    let audit = build_audit_log(&cli).await?;
     let operator =
         service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);
 
@@ -191,6 +197,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the audit log (AD-21): Postgres-backed + durable when `--database-url`
+/// is set (the coordinator is then stateless), otherwise in-memory single-node.
+async fn build_audit_log(cli: &Cli) -> anyhow::Result<Arc<dyn osa_core::ports::AuditLog>> {
+    match &cli.database_url {
+        Some(url) => {
+            let pool = db::connect(url).await?;
+            db::migrate(&pool).await?;
+            tracing::info!("audit log: Postgres (durable, stateless-ready)");
+            Ok(Arc::new(audit_log::PgAuditLog::new(pool)))
+        }
+        None => {
+            tracing::warn!(
+                "no --database-url — audit log is in-memory (single-node; lost on restart)"
+            );
+            Ok(Arc::new(audit_log::MemoryAuditLog::new()))
+        }
+    }
 }
 
 /// Build the deny-by-default RBAC PDP (AD-19) from the policy file, or an
