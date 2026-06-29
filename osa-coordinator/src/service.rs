@@ -17,6 +17,7 @@ use osa_core::HostId;
 use osa_core::audit::{AuditRecord, Decision};
 use osa_core::auth::Subject;
 use osa_core::ports::{AuditLog, CertIssuer, PolicyEngine, PortError};
+use osa_proto::v1::enrollment_server::Enrollment;
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
     DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse, ExportAuditRequest,
@@ -29,7 +30,11 @@ use crate::ca::EmbeddedCa;
 use crate::revocation::Revocations;
 use crate::token::{JoinTokens, MintError};
 
-/// Implements the `Operator` service over the embedded CA + token registry.
+/// Backs both gRPC services: the agent-facing `Enrollment` (self-authenticating)
+/// and the operator-facing `Operator` (OIDC/JWT-gated). Cloning is cheap — every
+/// field is an `Arc` or a `Copy` config value, and the clone shares the same
+/// CA/token/revocation/audit/policy state.
+#[derive(Clone)]
 pub struct OperatorService {
     ca: Arc<EmbeddedCa>,
     tokens: Arc<dyn JoinTokens>,
@@ -96,76 +101,6 @@ impl Operator for OperatorService {
             join_token,
             expires_at_unix,
         }))
-    }
-
-    async fn enroll(
-        &self,
-        request: Request<EnrollRequest>,
-    ) -> Result<Response<EnrollResponse>, Status> {
-        let EnrollRequest { join_token, csr } = request.into_inner();
-
-        // Validate the CSR BEFORE redeeming, so a malformed CSR cannot burn the
-        // single-use token.
-        self.ca
-            .validate_csr(&csr)
-            .map_err(|_| Status::invalid_argument("malformed CSR"))?;
-
-        // Atomically redeem the single-use token. All failure reasons collapse to
-        // one opaque status (no token-existence oracle); the reason is logged.
-        self.tokens.redeem(&join_token).await.map_err(|reason| {
-            tracing::info!(?reason, "join token redemption denied");
-            Status::permission_denied("invalid or expired join token")
-        })?;
-
-        let host_id = HostId::new();
-        let cert = self.ca.sign(host_id, &csr).await.map_err(|e| match e {
-            PortError::Invalid(_) => Status::invalid_argument("malformed CSR"),
-            other => {
-                tracing::error!(error = %other, "signing failed after token redeemed");
-                Status::internal("certificate issuance failed")
-            }
-        })?;
-
-        Ok(Response::new(EnrollResponse {
-            host_id: host_id.0.to_string(),
-            cert,
-            ca_root: self.ca.ca_root_der(),
-        }))
-    }
-
-    async fn renew(
-        &self,
-        request: Request<RenewRequest>,
-    ) -> Result<Response<RenewResponse>, Status> {
-        let RenewRequest { current_cert, csr } = request.into_inner();
-        // Validate the renewal (cert signed by us, valid, same-key CSR) and get
-        // the identity. The revocation check (async, possibly Postgres-backed)
-        // sits between validation and issuance.
-        let host_id = self
-            .ca
-            .validate_renewal(&current_cert, &csr)
-            .map_err(|e| match e {
-                PortError::Invalid(m) => Status::permission_denied(m),
-                other => {
-                    tracing::error!(error = %other, "renewal validation failed");
-                    Status::internal("certificate renewal failed")
-                }
-            })?;
-        // Fail closed if the revocation store is unreachable (never issue when we
-        // can't confirm the identity is live). A revoke landing between this check
-        // and the issuance below would still let one renewal through — an accepted
-        // window bounded by the short cert TTL (broker-connect enforcement is #16).
-        if self.revocations.is_revoked(host_id).await.map_err(|e| {
-            tracing::error!(error = %e, "revocation check failed");
-            Status::internal("revocation check unavailable")
-        })? {
-            return Err(Status::permission_denied("identity revoked"));
-        }
-        let cert = self.ca.sign(host_id, &csr).await.map_err(|e| {
-            tracing::error!(error = %e, "renewal issuance failed");
-            Status::internal("certificate renewal failed")
-        })?;
-        Ok(Response::new(RenewResponse { cert }))
     }
 
     async fn revoke(
@@ -269,6 +204,79 @@ impl Operator for OperatorService {
             })
             .collect();
         Ok(Response::new(ExportAuditResponse { entries }))
+    }
+}
+
+#[tonic::async_trait]
+impl Enrollment for OperatorService {
+    async fn enroll(
+        &self,
+        request: Request<EnrollRequest>,
+    ) -> Result<Response<EnrollResponse>, Status> {
+        let EnrollRequest { join_token, csr } = request.into_inner();
+
+        // Validate the CSR BEFORE redeeming, so a malformed CSR cannot burn the
+        // single-use token.
+        self.ca
+            .validate_csr(&csr)
+            .map_err(|_| Status::invalid_argument("malformed CSR"))?;
+
+        // Atomically redeem the single-use token. All failure reasons collapse to
+        // one opaque status (no token-existence oracle); the reason is logged.
+        self.tokens.redeem(&join_token).await.map_err(|reason| {
+            tracing::info!(?reason, "join token redemption denied");
+            Status::permission_denied("invalid or expired join token")
+        })?;
+
+        let host_id = HostId::new();
+        let cert = self.ca.sign(host_id, &csr).await.map_err(|e| match e {
+            PortError::Invalid(_) => Status::invalid_argument("malformed CSR"),
+            other => {
+                tracing::error!(error = %other, "signing failed after token redeemed");
+                Status::internal("certificate issuance failed")
+            }
+        })?;
+
+        Ok(Response::new(EnrollResponse {
+            host_id: host_id.0.to_string(),
+            cert,
+            ca_root: self.ca.ca_root_der(),
+        }))
+    }
+
+    async fn renew(
+        &self,
+        request: Request<RenewRequest>,
+    ) -> Result<Response<RenewResponse>, Status> {
+        let RenewRequest { current_cert, csr } = request.into_inner();
+        // Validate the renewal (cert signed by us, valid, same-key CSR) and get
+        // the identity. The revocation check (async, possibly Postgres-backed)
+        // sits between validation and issuance.
+        let host_id = self
+            .ca
+            .validate_renewal(&current_cert, &csr)
+            .map_err(|e| match e {
+                PortError::Invalid(m) => Status::permission_denied(m),
+                other => {
+                    tracing::error!(error = %other, "renewal validation failed");
+                    Status::internal("certificate renewal failed")
+                }
+            })?;
+        // Fail closed if the revocation store is unreachable (never issue when we
+        // can't confirm the identity is live). A revoke landing between this check
+        // and the issuance below would still let one renewal through — an accepted
+        // window bounded by the short cert TTL (broker-connect enforcement is #16).
+        if self.revocations.is_revoked(host_id).await.map_err(|e| {
+            tracing::error!(error = %e, "revocation check failed");
+            Status::internal("revocation check unavailable")
+        })? {
+            return Err(Status::permission_denied("identity revoked"));
+        }
+        let cert = self.ca.sign(host_id, &csr).await.map_err(|e| {
+            tracing::error!(error = %e, "renewal issuance failed");
+            Status::internal("certificate renewal failed")
+        })?;
+        Ok(Response::new(RenewResponse { cert }))
     }
 }
 
