@@ -3,20 +3,33 @@
  * SPDX-License-Identifier: MIT
  */
 
-//! In-memory single-use join-token registry (AD-25).
+//! Single-use join-token registry (AD-25).
 //!
 //! A join token is a high-entropy secret minted by the coordinator and redeemed
-//! exactly once during enrollment. Redemption is **atomic** under concurrency —
-//! the registry mutex serializes the check-and-mark so simultaneous redemptions
-//! of the same token yield exactly one winner.
-//!
-//! Storage is in-memory for v1 (tens of hosts). Persistence across replicas
-//! lands with the Postgres registry (Epic 2 / AD-24); expired-token pruning is a
-//! follow-up.
+//! exactly once during enrollment. Redemption is **atomic** so simultaneous
+//! redemptions of the same token yield exactly one winner — the in-memory
+//! adapter serializes via a mutex; the Postgres adapter via a conditional UPDATE
+//! that is atomic across replicas (AD-24).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Row};
+
+/// Mint a single-use token and redeem it exactly once. The two adapters
+/// ([`JoinTokenRegistry`] in-memory, [`PgJoinTokens`] durable/cross-replica)
+/// differ only in storage and the scope of the redemption atomicity.
+#[async_trait]
+pub trait JoinTokens: Send + Sync {
+    /// Mint a token valid for `ttl` (clamped to the registry max). Returns the
+    /// token and its absolute expiry (unix seconds).
+    async fn mint(&self, ttl: Duration) -> Result<(String, i64), MintError>;
+    /// Redeem a token exactly once.
+    async fn redeem(&self, token: &str) -> Result<(), RedeemError>;
+}
 
 /// Why a redemption was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +40,8 @@ pub enum RedeemError {
     Expired,
     /// The token was already redeemed.
     AlreadyRedeemed,
+    /// The storage backend failed (logged at the adapter before mapping here).
+    Backend,
 }
 
 /// Why minting failed.
@@ -34,9 +49,10 @@ pub enum RedeemError {
 pub enum MintError {
     /// The OS CSPRNG failed.
     Rng(getrandom::Error),
-    /// Too many outstanding tokens — back-pressure against an unauthenticated
-    /// mint surface (operator auth lands in Epic 2).
+    /// Too many outstanding tokens — back-pressure on the mint surface.
     Full,
+    /// The storage backend failed.
+    Backend(String),
 }
 
 impl std::fmt::Display for MintError {
@@ -44,8 +60,19 @@ impl std::fmt::Display for MintError {
         match self {
             MintError::Rng(e) => write!(f, "rng failure: {e}"),
             MintError::Full => write!(f, "too many outstanding join tokens"),
+            MintError::Backend(e) => write!(f, "token store failure: {e}"),
         }
     }
+}
+
+/// SHA-256 of a token — what the Postgres adapter stores, so the secret itself
+/// never lands in the database.
+fn token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn now_unix() -> i64 {
+    unix_seconds(SystemTime::now())
 }
 
 /// Default cap on outstanding (unredeemed, unexpired) tokens.
@@ -132,6 +159,135 @@ impl JoinTokenRegistry {
         }
         state.redeemed = true;
         Ok(())
+    }
+}
+
+/// The in-memory registry as a [`JoinTokens`] adapter (no-DB / dev mode). The
+/// inherent sync methods above carry the logic; these just expose it on the
+/// async port.
+#[async_trait]
+impl JoinTokens for JoinTokenRegistry {
+    async fn mint(&self, ttl: Duration) -> Result<(String, i64), MintError> {
+        JoinTokenRegistry::mint(self, ttl)
+    }
+    async fn redeem(&self, token: &str) -> Result<(), RedeemError> {
+        JoinTokenRegistry::redeem(self, token)
+    }
+}
+
+/// Durable, cross-replica single-use join tokens in Postgres (AD-24, AD-25).
+/// Stores only the token hash; redemption is atomic across replicas.
+///
+/// Expiry is evaluated against each replica's wall clock, so replicas should be
+/// NTP-synced — TTLs are minutes and typical skew is seconds, so the practical
+/// window is small, but it is a distributed-correctness assumption.
+pub struct PgJoinTokens {
+    pool: PgPool,
+    max_ttl: Duration,
+    cap: usize,
+}
+
+impl PgJoinTokens {
+    pub fn new(pool: PgPool, max_ttl: Duration) -> Self {
+        Self::with_cap(pool, max_ttl, DEFAULT_MAX_OUTSTANDING)
+    }
+
+    /// With an explicit outstanding-token cap (used in tests).
+    pub(crate) fn with_cap(pool: PgPool, max_ttl: Duration, cap: usize) -> Self {
+        Self { pool, max_ttl, cap }
+    }
+}
+
+#[async_trait]
+impl JoinTokens for PgJoinTokens {
+    async fn mint(&self, ttl: Duration) -> Result<(String, i64), MintError> {
+        let ttl = ttl.min(self.max_ttl);
+        let now = now_unix();
+        // Expiry is half-open: a token is valid for `[mint, expires_at)`, so a
+        // ZERO ttl is dead on arrival (`expires_at == now`, and `> now` is false).
+        let expires_at = now.saturating_add(ttl.as_secs() as i64);
+
+        // Reclaim terminal rows so the table tracks only *outstanding* tokens
+        // (mirrors the in-memory sweep; bounds growth). Deleting already-redeemed
+        // or already-expired rows is idempotent and cross-replica safe — it can
+        // never affect a live, unredeemed token.
+        sqlx::query(
+            "DELETE FROM join_token WHERE redeemed_at_unix IS NOT NULL OR expires_at_unix <= $1",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MintError::Backend(e.to_string()))?;
+
+        // Best-effort back-pressure: cap outstanding tokens. A small race past
+        // the cap under concurrency is acceptable (the surface is operator-gated).
+        let outstanding: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM join_token WHERE redeemed_at_unix IS NULL AND expires_at_unix > $1",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MintError::Backend(e.to_string()))?;
+        if outstanding as usize >= self.cap {
+            return Err(MintError::Full);
+        }
+
+        let mut raw = [0u8; 32];
+        getrandom::fill(&mut raw).map_err(MintError::Rng)?;
+        let token = hex(&raw);
+        sqlx::query("INSERT INTO join_token (token_hash, expires_at_unix) VALUES ($1, $2)")
+            .bind(&token_hash(&token)[..])
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MintError::Backend(e.to_string()))?;
+        Ok((token, expires_at))
+    }
+
+    async fn redeem(&self, token: &str) -> Result<(), RedeemError> {
+        let hash = token_hash(token);
+        let now = now_unix();
+        // Atomic single-use across replicas: mark redeemed only if currently
+        // unredeemed and unexpired. Exactly one concurrent UPDATE affects the row.
+        let res = sqlx::query(
+            "UPDATE join_token SET redeemed_at_unix = $2 \
+             WHERE token_hash = $1 AND redeemed_at_unix IS NULL AND expires_at_unix > $2",
+        )
+        .bind(&hash[..])
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "join token redeem failed");
+            RedeemError::Backend
+        })?;
+        // `token_hash` is the PRIMARY KEY, so the predicate matches at most one
+        // row; Postgres serializes the concurrent writers (row lock + re-check),
+        // so exactly one caller — across all replicas — sees `rows_affected == 1`.
+        if res.rows_affected() == 1 {
+            return Ok(());
+        }
+
+        // The update matched nothing — classify why (for logging only; the
+        // service collapses all redemption failures to one opaque status).
+        let row = sqlx::query("SELECT redeemed_at_unix FROM join_token WHERE token_hash = $1")
+            .bind(&hash[..])
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| RedeemError::Backend)?;
+        match row {
+            None => Err(RedeemError::Unknown),
+            Some(row) => {
+                let redeemed: Option<i64> = row
+                    .try_get("redeemed_at_unix")
+                    .map_err(|_| RedeemError::Backend)?;
+                if redeemed.is_some() {
+                    Err(RedeemError::AlreadyRedeemed)
+                } else {
+                    Err(RedeemError::Expired)
+                }
+            }
+        }
     }
 }
 
@@ -223,5 +379,111 @@ mod tests {
             .expect("sweep should reclaim the redeemed token");
         assert_eq!(r.redeem(&a), Err(RedeemError::Unknown));
         assert_eq!(r.redeem(&c), Ok(()));
+    }
+
+    // --- Postgres adapter (testcontainers; needs Docker) ---
+
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    /// An ephemeral migrated Postgres; returns the container (keep it alive) and
+    /// the connection URL so a test can open *independent* pools per "replica".
+    async fn pg_node_url() -> (
+        testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        String,
+    ) {
+        let node = Postgres::default()
+            .with_tag("17-alpine")
+            .start()
+            .await
+            .unwrap();
+        let port = node.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        (node, url)
+    }
+
+    async fn pg_tokens() -> (
+        testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        PgJoinTokens,
+    ) {
+        let (node, url) = pg_node_url().await;
+        let pool = crate::db::connect(&url).await.unwrap();
+        (node, PgJoinTokens::new(pool, Duration::from_secs(3600)))
+    }
+
+    #[tokio::test]
+    async fn pg_mint_then_redeem_once_then_denied() {
+        let (_node, r) = pg_tokens().await;
+        let (token, _) = r.mint(Duration::from_secs(600)).await.unwrap();
+        assert_eq!(r.redeem(&token).await, Ok(()));
+        assert_eq!(r.redeem(&token).await, Err(RedeemError::AlreadyRedeemed));
+        assert_eq!(r.redeem("deadbeef").await, Err(RedeemError::Unknown));
+    }
+
+    #[tokio::test]
+    async fn pg_expired_token_denied() {
+        let (_node, r) = pg_tokens().await;
+        let (token, _) = r.mint(Duration::ZERO).await.unwrap();
+        assert_eq!(r.redeem(&token).await, Err(RedeemError::Expired));
+    }
+
+    #[tokio::test]
+    async fn pg_concurrent_redemption_has_exactly_one_winner_across_replicas() {
+        // Two adapters over *independent pools* to the same database stand in for
+        // two replicas. The atomic conditional UPDATE must still yield exactly
+        // one winner when both replicas race to redeem the same token.
+        let (_node, url) = pg_node_url().await;
+        let a = Arc::new(PgJoinTokens::new(
+            crate::db::connect(&url).await.unwrap(),
+            Duration::from_secs(3600),
+        ));
+        let b = Arc::new(PgJoinTokens::new(
+            crate::db::connect(&url).await.unwrap(),
+            Duration::from_secs(3600),
+        ));
+        let (token, _) = a.mint(Duration::from_secs(600)).await.unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let replica = if i % 2 == 0 { a.clone() } else { b.clone() };
+            let token = token.clone();
+            tasks.push(tokio::spawn(
+                async move { replica.redeem(&token).await.is_ok() },
+            ));
+        }
+        let winners = futures_count(tasks).await;
+        assert_eq!(
+            winners, 1,
+            "exactly one redemption must win across replicas"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_mint_rejects_when_at_capacity() {
+        let (_node, url) = pg_node_url().await;
+        let r = PgJoinTokens::with_cap(
+            crate::db::connect(&url).await.unwrap(),
+            Duration::from_secs(600),
+            2,
+        );
+        r.mint(Duration::from_secs(600)).await.unwrap();
+        r.mint(Duration::from_secs(600)).await.unwrap();
+        assert!(matches!(
+            r.mint(Duration::from_secs(600)).await,
+            Err(MintError::Full)
+        ));
+    }
+
+    async fn futures_count(tasks: Vec<tokio::task::JoinHandle<bool>>) -> usize {
+        let mut wins = 0;
+        for t in tasks {
+            if t.await.unwrap() {
+                wins += 1;
+            }
+        }
+        wins
     }
 }

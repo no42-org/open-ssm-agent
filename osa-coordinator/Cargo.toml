@@ -40,7 +40,9 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Durable, stateless-over-Postgres store (AD-24, story 2.3b+). rustls; runtime-
 # checked queries (no build-time DB) + built-in migrator.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "uuid"] }
+# Hash join tokens before storing them in Postgres (never store the secret).
+sha2 = "0.10"
 
 [dev-dependencies]
 # Mint operator JWTs in the interceptor test (same crate osa-core validates with).

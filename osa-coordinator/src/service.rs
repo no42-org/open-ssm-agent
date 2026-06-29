@@ -26,14 +26,14 @@ use osa_proto::v1::{
 use tonic::{Request, Response, Status};
 
 use crate::ca::EmbeddedCa;
-use crate::revocation::RevocationRegistry;
-use crate::token::{JoinTokenRegistry, MintError};
+use crate::revocation::Revocations;
+use crate::token::{JoinTokens, MintError};
 
 /// Implements the `Operator` service over the embedded CA + token registry.
 pub struct OperatorService {
     ca: Arc<EmbeddedCa>,
-    tokens: Arc<JoinTokenRegistry>,
-    revocations: Arc<RevocationRegistry>,
+    tokens: Arc<dyn JoinTokens>,
+    revocations: Arc<dyn Revocations>,
     policy: Arc<dyn PolicyEngine>,
     audit: Arc<dyn AuditLog>,
     default_ttl: Duration,
@@ -42,8 +42,8 @@ pub struct OperatorService {
 impl OperatorService {
     pub fn new(
         ca: Arc<EmbeddedCa>,
-        tokens: Arc<JoinTokenRegistry>,
-        revocations: Arc<RevocationRegistry>,
+        tokens: Arc<dyn JoinTokens>,
+        revocations: Arc<dyn Revocations>,
         policy: Arc<dyn PolicyEngine>,
         audit: Arc<dyn AuditLog>,
         default_ttl: Duration,
@@ -84,10 +84,10 @@ impl Operator for OperatorService {
             0 => self.default_ttl,
             secs => Duration::from_secs(secs),
         };
-        let (join_token, expires_at_unix) = self.tokens.mint(ttl).map_err(|e| match e {
+        let (join_token, expires_at_unix) = self.tokens.mint(ttl).await.map_err(|e| match e {
             MintError::Full => Status::resource_exhausted("join token capacity reached"),
-            MintError::Rng(rng) => {
-                tracing::error!(error = %rng, "token mint failed");
+            MintError::Rng(_) | MintError::Backend(_) => {
+                tracing::error!(error = %e, "token mint failed");
                 Status::internal("token mint failed")
             }
         })?;
@@ -112,7 +112,7 @@ impl Operator for OperatorService {
 
         // Atomically redeem the single-use token. All failure reasons collapse to
         // one opaque status (no token-existence oracle); the reason is logged.
-        self.tokens.redeem(&join_token).map_err(|reason| {
+        self.tokens.redeem(&join_token).await.map_err(|reason| {
             tracing::info!(?reason, "join token redemption denied");
             Status::permission_denied("invalid or expired join token")
         })?;
@@ -138,17 +138,33 @@ impl Operator for OperatorService {
         request: Request<RenewRequest>,
     ) -> Result<Response<RenewResponse>, Status> {
         let RenewRequest { current_cert, csr } = request.into_inner();
-        let cert = self
+        // Validate the renewal (cert signed by us, valid, same-key CSR) and get
+        // the identity. The revocation check (async, possibly Postgres-backed)
+        // sits between validation and issuance.
+        let host_id = self
             .ca
-            .renew(&current_cert, &csr, |h| self.revocations.is_revoked(h))
+            .validate_renewal(&current_cert, &csr)
             .map_err(|e| match e {
                 PortError::Invalid(m) => Status::permission_denied(m),
-                PortError::Denied => Status::permission_denied("identity revoked"),
                 other => {
-                    tracing::error!(error = %other, "renewal failed");
+                    tracing::error!(error = %other, "renewal validation failed");
                     Status::internal("certificate renewal failed")
                 }
             })?;
+        // Fail closed if the revocation store is unreachable (never issue when we
+        // can't confirm the identity is live). A revoke landing between this check
+        // and the issuance below would still let one renewal through — an accepted
+        // window bounded by the short cert TTL (broker-connect enforcement is #16).
+        if self.revocations.is_revoked(host_id).await.map_err(|e| {
+            tracing::error!(error = %e, "revocation check failed");
+            Status::internal("revocation check unavailable")
+        })? {
+            return Err(Status::permission_denied("identity revoked"));
+        }
+        let cert = self.ca.sign(host_id, &csr).await.map_err(|e| {
+            tracing::error!(error = %e, "renewal issuance failed");
+            Status::internal("certificate renewal failed")
+        })?;
         Ok(Response::new(RenewResponse { cert }))
     }
 
@@ -162,7 +178,10 @@ impl Operator for OperatorService {
             .parse::<uuid::Uuid>()
             .map(HostId)
             .map_err(|_| Status::invalid_argument("host_id is not a UUID"))?;
-        self.revocations.revoke(host_id);
+        self.revocations.revoke(host_id).await.map_err(|e| {
+            tracing::error!(error = %e, "revocation store write failed");
+            Status::internal("revocation store unavailable")
+        })?;
         tracing::info!(host_id = %host_id.0, "host identity revoked");
         Ok(Response::new(RevokeResponse {}))
     }
@@ -256,6 +275,8 @@ impl Operator for OperatorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::revocation::RevocationRegistry;
+    use crate::token::JoinTokenRegistry;
     use rcgen::{CertificateParams, KeyPair};
     use x509_parser::prelude::{FromDer, X509Certificate};
 

@@ -162,10 +162,39 @@ async fn main() -> anyhow::Result<()> {
     wait_until_listening(mqtt_addr).await?;
     tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) listening");
 
-    let tokens = Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL));
-    let revocations = Arc::new(revocation::RevocationRegistry::new());
+    // Shared coordinator state (AD-24): durable in Postgres when --database-url
+    // is set (stateless across replicas), otherwise in-memory single-node.
+    let pool = match &cli.database_url {
+        Some(url) => {
+            let pool = db::connect(url).await?;
+            db::migrate(&pool).await?;
+            tracing::info!("state: Postgres (durable, stateless-ready)");
+            Some(pool)
+        }
+        None => {
+            tracing::warn!(
+                "no --database-url — token/revocation/audit state is in-memory (single-node; lost on restart)"
+            );
+            None
+        }
+    };
+    let (tokens, revocations, audit): (
+        Arc<dyn token::JoinTokens>,
+        Arc<dyn revocation::Revocations>,
+        Arc<dyn osa_core::ports::AuditLog>,
+    ) = match &pool {
+        Some(pool) => (
+            Arc::new(token::PgJoinTokens::new(pool.clone(), MAX_TOKEN_TTL)),
+            Arc::new(revocation::PgRevocations::new(pool.clone())),
+            Arc::new(audit_log::PgAuditLog::new(pool.clone())),
+        ),
+        None => (
+            Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL)),
+            Arc::new(revocation::RevocationRegistry::new()),
+            Arc::new(audit_log::MemoryAuditLog::new()),
+        ),
+    };
     let policy = build_policy_engine(&cli)?;
-    let audit = build_audit_log(&cli).await?;
     let operator =
         service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);
 
@@ -197,25 +226,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Build the audit log (AD-21): Postgres-backed + durable when `--database-url`
-/// is set (the coordinator is then stateless), otherwise in-memory single-node.
-async fn build_audit_log(cli: &Cli) -> anyhow::Result<Arc<dyn osa_core::ports::AuditLog>> {
-    match &cli.database_url {
-        Some(url) => {
-            let pool = db::connect(url).await?;
-            db::migrate(&pool).await?;
-            tracing::info!("audit log: Postgres (durable, stateless-ready)");
-            Ok(Arc::new(audit_log::PgAuditLog::new(pool)))
-        }
-        None => {
-            tracing::warn!(
-                "no --database-url — audit log is in-memory (single-node; lost on restart)"
-            );
-            Ok(Arc::new(audit_log::MemoryAuditLog::new()))
-        }
-    }
 }
 
 /// Build the deny-by-default RBAC PDP (AD-19) from the policy file, or an

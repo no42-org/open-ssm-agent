@@ -150,17 +150,14 @@ impl EmbeddedCa {
         Ok(cert.der().to_vec())
     }
 
-    /// Renew an existing identity (AD-11/AD-28). Verifies `current_cert` was
-    /// issued by this CA, is currently valid, and that `csr` carries the **same
-    /// key** (so the CSR's proof-of-possession also proves the requester holds
-    /// the current identity), then reissues a fresh cert for the same `host_id`
-    /// — no join token.
-    pub fn renew(
-        &self,
-        current_cert: &[u8],
-        csr: &[u8],
-        is_revoked: impl Fn(HostId) -> bool,
-    ) -> Result<Vec<u8>, PortError> {
+    /// Validate a renewal request (AD-11/AD-28): verify `current_cert` was issued
+    /// by this CA, is currently valid, and that `csr` carries the **same key** (so
+    /// the CSR's proof-of-possession also proves the requester holds the current
+    /// identity). Returns the identity to reissue for. The caller checks
+    /// revocation (async, AD-28) and then issues via [`CertIssuer::sign`] — no
+    /// join token. Splitting validation from issuance lets the (async,
+    /// Postgres-backed) revocation check sit between them.
+    pub fn validate_renewal(&self, current_cert: &[u8], csr: &[u8]) -> Result<HostId, PortError> {
         let (_, cert) = X509Certificate::from_der(current_cert)
             .map_err(|_| PortError::Invalid("malformed current certificate".into()))?;
         let ca_der = self.ca_root_der();
@@ -174,9 +171,6 @@ impl EmbeddedCa {
             ));
         }
         let host_id = host_id_from_cert(&cert)?;
-        if is_revoked(host_id) {
-            return Err(PortError::Denied);
-        }
 
         // `from_der` verifies the CSR's proof-of-possession signature. Requiring
         // the CSR's public key to equal the current cert's key then means the
@@ -190,7 +184,7 @@ impl EmbeddedCa {
                 "CSR key does not match the current identity".into(),
             ));
         }
-        self.issue(host_id, csr)
+        Ok(host_id)
     }
 }
 
@@ -340,17 +334,19 @@ mod tests {
     }
 
     #[test]
-    fn renew_reissues_for_the_same_host() {
+    fn validate_renewal_accepts_the_same_key_and_reissues() {
         let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
         let key = KeyPair::generate().unwrap();
         let host = HostId::new();
         let cert0 = ca.issue(host, &csr_with_key(&key)).unwrap();
 
-        // Renew with a CSR using the SAME key — no token needed.
-        let cert1 = ca.renew(&cert0, &csr_with_key(&key), |_| false).unwrap();
+        // Validation returns the identity; the same key is required (no token).
+        let renewed = ca.validate_renewal(&cert0, &csr_with_key(&key)).unwrap();
+        assert_eq!(renewed, host);
 
+        // Issuance for that identity yields a cert with the same SAN, CA-signed.
+        let cert1 = ca.issue(renewed, &csr_with_key(&key)).unwrap();
         let (_, c1) = X509Certificate::from_der(&cert1).unwrap();
-        // Same host_id SAN...
         let san = c1.subject_alternative_name().unwrap().unwrap();
         let uri = san
             .value
@@ -362,26 +358,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(uri, host_san_uri(host));
-        // ...and signed by this CA.
         let ca_der = ca.ca_root_der();
         let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
         c1.verify_signature(Some(ca_cert.public_key())).unwrap();
     }
 
     #[test]
-    fn renew_rejects_a_csr_with_a_different_key() {
+    fn validate_renewal_rejects_a_csr_with_a_different_key() {
         let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
         let key = KeyPair::generate().unwrap();
         let cert0 = ca.issue(HostId::new(), &csr_with_key(&key)).unwrap();
         let other = KeyPair::generate().unwrap();
         assert!(matches!(
-            ca.renew(&cert0, &csr_with_key(&other), |_| false),
+            ca.validate_renewal(&cert0, &csr_with_key(&other)),
             Err(PortError::Invalid(_))
         ));
     }
 
     #[test]
-    fn renew_rejects_a_cert_from_another_ca() {
+    fn validate_renewal_rejects_a_cert_from_another_ca() {
         let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
         let foreign_ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
         let key = KeyPair::generate().unwrap();
@@ -389,30 +384,18 @@ mod tests {
             .issue(HostId::new(), &csr_with_key(&key))
             .unwrap();
         assert!(matches!(
-            ca.renew(&foreign, &csr_with_key(&key), |_| false),
+            ca.validate_renewal(&foreign, &csr_with_key(&key)),
             Err(PortError::Invalid(_))
         ));
     }
 
     #[test]
-    fn renew_rejects_a_malformed_current_cert() {
+    fn validate_renewal_rejects_a_malformed_current_cert() {
         let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
         let key = KeyPair::generate().unwrap();
         assert!(matches!(
-            ca.renew(b"not a certificate", &csr_with_key(&key), |_| false),
+            ca.validate_renewal(b"not a certificate", &csr_with_key(&key)),
             Err(PortError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn renew_refuses_a_revoked_identity() {
-        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
-        let key = KeyPair::generate().unwrap();
-        let cert0 = ca.issue(HostId::new(), &csr_with_key(&key)).unwrap();
-        // The identity is revoked: renewal is denied even with a valid cert + CSR.
-        assert!(matches!(
-            ca.renew(&cert0, &csr_with_key(&key), |_| true),
-            Err(PortError::Denied)
         ));
     }
 }
