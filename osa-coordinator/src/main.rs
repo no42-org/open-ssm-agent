@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use osa_proto::v1::enrollment_server::EnrollmentServer;
 use osa_proto::v1::operator_server::OperatorServer;
 
 mod audit_log;
@@ -200,18 +201,24 @@ async fn main() -> anyhow::Result<()> {
 
     let jwt_auth = build_operator_auth(&cli).await?;
 
+    // The Enrollment service (Enroll/Renew) is agent-facing and self-authenticating
+    // (join token / cert proof-of-possession) — it is NEVER behind the operator
+    // OIDC/JWT gate. Only the operator-facing Operator service is interceptor-gated.
+    let enrollment = EnrollmentServer::new(operator.clone());
+
     // Bound per-request time and per-connection concurrency to blunt abuse of the
     // enrollment surface.
     let mut server = tonic::transport::Server::builder()
         .timeout(Duration::from_secs(30))
         .concurrency_limit_per_connection(64);
 
-    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator gRPC (plaintext)");
+    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator + Enrollment gRPC (plaintext)");
     match jwt_auth {
         Some(jwt_auth) => {
             tracing::info!("operator authentication: OIDC/JWT required (AD-18)");
             server
                 .add_service(OperatorServer::with_interceptor(operator, jwt_auth))
+                .add_service(enrollment)
                 .serve(addr)
                 .await?;
         }
@@ -221,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             );
             server
                 .add_service(OperatorServer::new(operator))
+                .add_service(enrollment)
                 .serve(addr)
                 .await?;
         }

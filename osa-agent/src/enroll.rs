@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use osa_proto::v1::operator_client::OperatorClient;
+use osa_proto::v1::enrollment_client::EnrollmentClient;
 use osa_proto::v1::{EnrollRequest, RenewRequest};
 use tokio::time::sleep;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -68,7 +68,7 @@ pub async fn run(
         .der()
         .to_vec();
 
-    let mut client = OperatorClient::connect(coordinator)
+    let mut client = EnrollmentClient::connect(coordinator)
         .await
         .context("connecting to coordinator")?;
     let resp = client
@@ -179,7 +179,7 @@ pub async fn renew(coordinator: String, state_dir: &Path) -> anyhow::Result<()> 
         .der()
         .to_vec();
 
-    let mut client = OperatorClient::connect(coordinator)
+    let mut client = EnrollmentClient::connect(coordinator)
         .await
         .context("connecting to coordinator")?;
     let resp = client

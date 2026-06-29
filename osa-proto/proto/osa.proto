@@ -40,19 +40,29 @@ message ActionDescriptor {
   bytes params_hash = 4; // canonical hash of the opaque params
 }
 
-// Operator-facing enrollment surface (AD-5, AD-25). The agent generates its
-// keypair locally and presents a short-TTL single-use join token + CSR; the
-// coordinator validates, assigns host_id, and returns a signed mTLS cert.
-service Operator {
-  // Mint a short-TTL single-use join token for a new host (AD-25). v1 leaves
-  // this unauthenticated; operator authn/authz is added in the enforcement
-  // spine (Epic 2, AD-18/AD-19).
-  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
+// Agent-facing enrollment surface (AD-25). These RPCs carry their **own**
+// authentication — a single-use join token (Enroll) or the current cert + a CSR
+// proving key possession (Renew) — so they are NOT behind the operator OIDC/JWT
+// gate (AD-18); an enrolling agent has no operator token. Kept a separate
+// service from `Operator` precisely so the interceptor can gate one and not the
+// other.
+service Enrollment {
+  // Redeem a single-use join token + CSR. The agent generates its keypair
+  // locally; the coordinator validates, assigns host_id, and returns a signed
+  // mTLS cert + the pinned CA root (AD-25).
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
   // Renew an existing identity before its cert expires (AD-11/AD-28). No join
   // token: the request is authenticated by the current cert + a CSR that proves
   // possession of that identity's key.
   rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+// Operator-facing control surface (AD-5). Every RPC here is gated by operator
+// OIDC/JWT authentication (AD-18) and, for dispatch, deny-by-default RBAC
+// (AD-19).
+service Operator {
+  // Mint a short-TTL single-use join token for a new host (AD-25).
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   // Revoke a host identity (AD-28). The host can no longer renew, so its
   // short-lived cert lapses within its TTL.
   rpc Revoke(RevokeRequest) returns (RevokeResponse);
