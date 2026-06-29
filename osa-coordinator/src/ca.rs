@@ -116,7 +116,7 @@ impl EmbeddedCa {
         // and every issued cert would silently fail to chain. (`from_ca_cert_pem`
         // does not check this.)
         let (_, parsed) = X509Certificate::from_der(&cert_der)
-            .map_err(|e| PortError::Invalid(format!("stored CA cert is unparseable: {e}")))?;
+            .map_err(|e| PortError::Invalid(format!("stored CA cert could not be parsed: {e}")))?;
         if key.der_bytes() != parsed.public_key().subject_public_key.data.as_ref() {
             return Err(PortError::Invalid(
                 "stored CA key does not match the stored CA cert".into(),
