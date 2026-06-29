@@ -140,9 +140,30 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --mqtt-bind {:?}: {e}", cli.mqtt_bind))?;
 
-    // Initialize the embedded CA (AD-23). For now it is generated in-memory at
-    // startup; persistence lands in a later story (#7).
-    let ca = Arc::new(ca::EmbeddedCa::new(HOST_CERT_TTL)?);
+    // Shared coordinator state (AD-24): durable in Postgres when --database-url
+    // is set (stateless across replicas), otherwise in-memory single-node.
+    let pool = match &cli.database_url {
+        Some(url) => {
+            let pool = db::connect(url).await?;
+            db::migrate(&pool).await?;
+            tracing::info!("state: Postgres (durable, stateless-ready)");
+            Some(pool)
+        }
+        None => {
+            tracing::warn!(
+                "no --database-url — CA/token/revocation/audit state is in-memory (single-node; lost on restart)"
+            );
+            None
+        }
+    };
+
+    // The embedded CA (AD-23). With Postgres it is generated once and shared by
+    // every replica (closes #7); without, it is in-memory and regenerated on
+    // restart. The CA must exist before the broker (its server cert is CA-signed).
+    let ca = Arc::new(match &pool {
+        Some(pool) => ca::load_or_generate(pool, HOST_CERT_TTL).await?,
+        None => ca::EmbeddedCa::new(HOST_CERT_TTL)?,
+    });
 
     // Stand up the embedded mTLS broker: issue its server cert from the CA (so an
     // agent that pinned the CA root trusts it) and write the TLS material to a
@@ -163,22 +184,6 @@ async fn main() -> anyhow::Result<()> {
     wait_until_listening(mqtt_addr).await?;
     tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) listening");
 
-    // Shared coordinator state (AD-24): durable in Postgres when --database-url
-    // is set (stateless across replicas), otherwise in-memory single-node.
-    let pool = match &cli.database_url {
-        Some(url) => {
-            let pool = db::connect(url).await?;
-            db::migrate(&pool).await?;
-            tracing::info!("state: Postgres (durable, stateless-ready)");
-            Some(pool)
-        }
-        None => {
-            tracing::warn!(
-                "no --database-url — token/revocation/audit state is in-memory (single-node; lost on restart)"
-            );
-            None
-        }
-    };
     let (tokens, revocations, audit): (
         Arc<dyn token::JoinTokens>,
         Arc<dyn revocation::Revocations>,

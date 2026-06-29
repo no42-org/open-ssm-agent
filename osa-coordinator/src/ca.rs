@@ -18,10 +18,11 @@ use osa_core::HostId;
 use osa_core::ports::{CertIssuer, PortError};
 use rcgen::string::Ia5String;
 use rcgen::{
-    CertificateParams, CertificateSigningRequestParams, CertifiedIssuer, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
+    CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
 };
 use rustls_pki_types::CertificateSigningRequestDer;
+use sqlx::{PgPool, Row};
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
@@ -29,46 +30,112 @@ use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 /// and the relying parties that validate the issued certificate.
 const CLOCK_SKEW: Duration = Duration::minutes(5);
 
+/// Advisory-lock key serializing the CA generate-once across replicas.
+const CA_LOCK_KEY: i64 = 0x05A_CA01;
+
 /// SAN URI form for a host identity: `urn:osa:host:<uuid>`.
 fn host_san_uri(host_id: HostId) -> String {
     format!("urn:osa:host:{}", host_id.0)
 }
 
+/// The CA's PEM material, for persistence (AD-24). The private key is sensitive:
+/// v1 stores it in a trusted Postgres; at-rest encryption is tracked in #35.
+pub struct CaMaterial {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
 /// An embedded certificate authority that signs host CSRs (AD-23).
+///
+/// Holds the signing [`Issuer`] plus the CA root cert bytes. Built either freshly
+/// ([`generate`](Self::generate)) or reconstructed from stored PEM material
+/// ([`from_material`](Self::from_material)) so every replica shares one CA (AD-24).
 pub struct EmbeddedCa {
-    issuer: CertifiedIssuer<'static, KeyPair>,
+    issuer: Issuer<'static, KeyPair>,
+    cert_der: Vec<u8>,
+    cert_pem: String,
     cert_ttl: Duration,
 }
 
+/// The CA root certificate parameters (self-signed, long-lived, KeyCertSign).
+fn ca_params() -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "open-ssm-agent embedded CA");
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - CLOCK_SKEW;
+    params.not_after = now + Duration::days(3650);
+    params
+}
+
 impl EmbeddedCa {
-    /// Generate a fresh self-signed CA. `cert_ttl` is the validity of the host
-    /// certificates this CA issues (kept short — AD-11/AD-28 favor renewal over
-    /// long-lived certs). Returns an error if `cert_ttl` is not positive.
+    /// Generate a fresh in-memory CA (single-node / dev / tests). Not persisted —
+    /// regenerates on restart. `cert_ttl` is the validity of the host certs it
+    /// issues (kept short — AD-11/AD-28 favor renewal). Errors if `cert_ttl <= 0`.
     pub fn new(cert_ttl: Duration) -> Result<Self, PortError> {
+        Ok(Self::generate(cert_ttl)?.0)
+    }
+
+    /// Generate a fresh CA and also return its PEM material so a caller can
+    /// persist it (the Postgres path, AD-24).
+    pub fn generate(cert_ttl: Duration) -> Result<(Self, CaMaterial), PortError> {
         if cert_ttl <= Duration::ZERO {
             return Err(PortError::Invalid("cert_ttl must be positive".into()));
         }
         let key = KeyPair::generate().map_err(|e| PortError::Backend(e.to_string()))?;
-
-        let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "open-ssm-agent embedded CA");
-        let now = OffsetDateTime::now_utc();
-        params.not_before = now - CLOCK_SKEW;
-        params.not_after = now + Duration::days(3650);
-
-        let issuer = CertifiedIssuer::self_signed(params, key)
+        let key_pem = key.serialize_pem();
+        let cert = ca_params()
+            .self_signed(&key)
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        Ok(Self { issuer, cert_ttl })
+        let cert_pem = cert.pem();
+        let ca = Self::from_material(&cert_pem, &key_pem, cert_ttl)?;
+        Ok((ca, CaMaterial { cert_pem, key_pem }))
+    }
+
+    /// Reconstruct a CA from stored PEM material so every replica signs with the
+    /// same identity (AD-24). An agent that pinned the CA root then trusts certs
+    /// issued by any replica.
+    pub fn from_material(
+        cert_pem: &str,
+        key_pem: &str,
+        cert_ttl: Duration,
+    ) -> Result<Self, PortError> {
+        if cert_ttl <= Duration::ZERO {
+            return Err(PortError::Invalid("cert_ttl must be positive".into()));
+        }
+        let key = KeyPair::from_pem(key_pem)
+            .map_err(|e| PortError::Invalid(format!("stored CA key is unusable: {e}")))?;
+        let cert_der = pem::parse(cert_pem)
+            .map_err(|e| PortError::Invalid(format!("stored CA cert is not valid PEM: {e}")))?
+            .into_contents();
+        // Integrity: the key MUST correspond to the cert's public key. Otherwise
+        // the rebuilt CA would sign with a key the published root doesn't match,
+        // and every issued cert would silently fail to chain. (`from_ca_cert_pem`
+        // does not check this.)
+        let (_, parsed) = X509Certificate::from_der(&cert_der)
+            .map_err(|e| PortError::Invalid(format!("stored CA cert could not be parsed: {e}")))?;
+        if key.der_bytes() != parsed.public_key().subject_public_key.data.as_ref() {
+            return Err(PortError::Invalid(
+                "stored CA key does not match the stored CA cert".into(),
+            ));
+        }
+        let issuer = Issuer::from_ca_cert_pem(cert_pem, key)
+            .map_err(|e| PortError::Invalid(format!("stored CA cert is unusable: {e}")))?;
+        Ok(Self {
+            issuer,
+            cert_der,
+            cert_pem: cert_pem.to_string(),
+            cert_ttl,
+        })
     }
 
     /// DER of the CA root certificate — delivered to agents in the join bundle
     /// for pinning (AD-25).
     pub fn ca_root_der(&self) -> Vec<u8> {
-        self.issuer.der().to_vec()
+        self.cert_der.clone()
     }
 
     /// Parse and verify a CSR without issuing a certificate. Enrollment uses this
@@ -82,7 +149,7 @@ impl EmbeddedCa {
 
     /// PEM of the CA root certificate (for TLS trust stores).
     pub fn ca_root_pem(&self) -> String {
-        self.issuer.pem()
+        self.cert_pem.clone()
     }
 
     /// Issue a short-lived **server** certificate (serverAuth) for the given DNS
@@ -186,6 +253,52 @@ impl EmbeddedCa {
         }
         Ok(host_id)
     }
+}
+
+/// Load the shared CA from Postgres, generating and persisting it exactly once
+/// if absent (AD-23/AD-24, closes #7). A transaction-scoped advisory lock
+/// serializes generation across replicas: only one replica generates the CA;
+/// every other waits and reads the same persisted material, so all replicas sign
+/// with one CA identity.
+pub async fn load_or_generate(pool: &PgPool, cert_ttl: Duration) -> anyhow::Result<EmbeddedCa> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CA_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing = sqlx::query("SELECT cert_pem, key_pem FROM ca_identity ORDER BY id ASC LIMIT 1")
+        .fetch_optional(&mut *tx)
+        .await?;
+    let ca = match existing {
+        Some(row) => {
+            let cert_pem: String = row.try_get("cert_pem")?;
+            let key_pem: String = row.try_get("key_pem")?;
+            EmbeddedCa::from_material(&cert_pem, &key_pem, cert_ttl)?
+        }
+        None => {
+            let (ca, material) = EmbeddedCa::generate(cert_ttl)?;
+            sqlx::query(
+                "INSERT INTO ca_identity (cert_pem, key_pem, created_at_unix) VALUES ($1, $2, $3)",
+            )
+            .bind(&material.cert_pem)
+            .bind(&material.key_pem)
+            .bind(now_unix())
+            .execute(&mut *tx)
+            .await?;
+            tracing::info!("generated and persisted the shared CA (AD-24)");
+            ca
+        }
+    };
+    tx.commit().await?;
+    Ok(ca)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Extract the `host_id` from a cert's `urn:osa:host:<uuid>` URI SAN.
@@ -397,5 +510,122 @@ mod tests {
             ca.validate_renewal(b"not a certificate", &csr_with_key(&key)),
             Err(PortError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_ca_reconstructed_from_material_still_signs_verifiably() {
+        // generate -> material -> from_material yields a working signer whose
+        // issued cert verifies against the (unchanged) CA root.
+        let (orig, material) = EmbeddedCa::generate(Duration::hours(24)).unwrap();
+        let rebuilt =
+            EmbeddedCa::from_material(&material.cert_pem, &material.key_pem, Duration::hours(24))
+                .unwrap();
+        assert_eq!(orig.ca_root_der(), rebuilt.ca_root_der(), "same CA root");
+
+        let key = KeyPair::generate().unwrap();
+        let host = HostId::new();
+        let cert = rebuilt.issue(host, &csr_with_key(&key)).unwrap();
+        let root_der = rebuilt.ca_root_der();
+        let (_, leaf) = X509Certificate::from_der(&cert).unwrap();
+        let (_, ca_root) = X509Certificate::from_der(&root_der).unwrap();
+        leaf.verify_signature(Some(ca_root.public_key()))
+            .expect("rebuilt CA must sign verifiable certs");
+        // Not just a raw signature: the leaf must actually chain to this root.
+        assert_eq!(
+            leaf.issuer(),
+            ca_root.subject(),
+            "leaf must chain to the root"
+        );
+    }
+
+    #[test]
+    fn from_material_rejects_unusable_or_mismatched_material() {
+        let (_, material) = EmbeddedCa::generate(Duration::hours(24)).unwrap();
+        // A key from a *different* CA does not match this cert → refused.
+        let (_, other) = EmbeddedCa::generate(Duration::hours(24)).unwrap();
+        assert!(matches!(
+            EmbeddedCa::from_material(&material.cert_pem, &other.key_pem, Duration::hours(24)),
+            Err(PortError::Invalid(_))
+        ));
+        // Garbage PEM, and a non-positive TTL, are also refused.
+        assert!(
+            EmbeddedCa::from_material("not pem", &material.key_pem, Duration::hours(24)).is_err()
+        );
+        assert!(matches!(
+            EmbeddedCa::from_material(&material.cert_pem, &material.key_pem, Duration::ZERO),
+            Err(PortError::Invalid(_))
+        ));
+    }
+
+    // --- Postgres shared-CA (testcontainers; needs Docker) ---
+
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    async fn pg_url() -> (
+        testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        String,
+    ) {
+        let node = Postgres::default()
+            .with_tag("17-alpine")
+            .start()
+            .await
+            .unwrap();
+        let port = node.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        (node, url)
+    }
+
+    #[tokio::test]
+    async fn two_replicas_share_one_generated_ca() {
+        // Two coordinators (independent pools) against one database: the first to
+        // boot generates the CA under the advisory lock; the second reads it.
+        // Both must end up with the SAME CA root, and a cert issued by one must
+        // verify against the other's root — the cross-replica trust requirement.
+        let (_node, url) = pg_url().await;
+        let pool_a = crate::db::connect(&url).await.unwrap();
+        let pool_b = crate::db::connect(&url).await.unwrap();
+
+        // Both replicas reach load_or_generate *concurrently* — the advisory lock
+        // must serialize them so exactly one generates and both get the same CA.
+        let (ra, rb) = tokio::join!(
+            load_or_generate(&pool_a, Duration::hours(24)),
+            load_or_generate(&pool_b, Duration::hours(24)),
+        );
+        let ca_a = ra.unwrap();
+        let ca_b = rb.unwrap();
+        assert_eq!(
+            ca_a.ca_root_der(),
+            ca_b.ca_root_der(),
+            "both replicas must share one CA"
+        );
+
+        // A cert enrolled via replica A verifies against replica B's CA root.
+        let key = KeyPair::generate().unwrap();
+        let cert = ca_a.issue(HostId::new(), &csr_with_key(&key)).unwrap();
+        let b_root_der = ca_b.ca_root_der();
+        let (_, leaf) = X509Certificate::from_der(&cert).unwrap();
+        let (_, b_root) = X509Certificate::from_der(&b_root_der).unwrap();
+        leaf.verify_signature(Some(b_root.public_key()))
+            .expect("A-issued cert must verify against B's CA root");
+        assert_eq!(
+            leaf.issuer(),
+            b_root.subject(),
+            "A's leaf must chain to B's root"
+        );
+    }
+
+    #[tokio::test]
+    async fn ca_survives_a_restart() {
+        // A fresh load over the same database (a coordinator restart) returns the
+        // persisted CA, not a new one.
+        let (_node, url) = pg_url().await;
+        let pool = crate::db::connect(&url).await.unwrap();
+        let first = load_or_generate(&pool, Duration::hours(24)).await.unwrap();
+        let again = load_or_generate(&pool, Duration::hours(24)).await.unwrap();
+        assert_eq!(first.ca_root_der(), again.ca_root_der());
     }
 }

@@ -2176,6 +2176,7 @@ dependencies = [
  "jsonwebtoken",
  "osa-core",
  "osa-proto",
+ "pem",
  "rcgen",
  "reqwest",
  "rumqttd",
