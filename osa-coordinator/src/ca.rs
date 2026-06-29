@@ -202,6 +202,14 @@ impl EmbeddedCa {
         params
             .distinguished_name
             .push(DnType::CommonName, host_id.0.to_string());
+        // O = host_id as hyphen-stripped UUID hex. The broker's
+        // `validate-tenant-prefix` reads this O field and confines the agent to
+        // its own `/tenants/<O>/…` topic subtree (per-host isolation, #16). It
+        // must be alphanumeric, hence the simple (hyphenless) form; the SAN keeps
+        // the canonical dashed UUID as the mTLS identity.
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, host_id.0.simple().to_string());
         params.subject_alt_names = vec![SanType::URI(san)];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
