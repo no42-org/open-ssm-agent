@@ -638,4 +638,104 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
+
+    // --- Two-replica statelessness milestone (testcontainers; needs Docker) ---
+
+    #[tokio::test]
+    async fn two_replicas_share_enrollment_revocation_and_ca() {
+        use testcontainers_modules::postgres::Postgres;
+        use testcontainers_modules::testcontainers::ImageExt;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+        let node = Postgres::default()
+            .with_tag("17-alpine")
+            .start()
+            .await
+            .unwrap();
+        let port = node.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool_a = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool_a).await.unwrap();
+        let pool_b = crate::db::connect(&url).await.unwrap();
+
+        // One shared CA, generated once; both replicas reconstruct it.
+        let ca = Arc::new(
+            crate::ca::load_or_generate(&pool_a, time::Duration::hours(24))
+                .await
+                .unwrap(),
+        );
+        let replica = |pool: sqlx::PgPool| {
+            OperatorService::new(
+                ca.clone(),
+                Arc::new(crate::token::PgJoinTokens::new(
+                    pool.clone(),
+                    Duration::from_secs(3600),
+                )),
+                Arc::new(crate::revocation::PgRevocations::new(pool.clone())),
+                Arc::new(crate::policy::RbacPolicyEngine::empty()),
+                Arc::new(crate::audit_log::PgAuditLog::new(pool)),
+                Duration::from_secs(900),
+            )
+        };
+        let a = replica(pool_a);
+        let b = replica(pool_b);
+
+        // Same-key CSR, reused for enroll + renew (renewal requires the same key).
+        let key = KeyPair::generate().unwrap();
+        let csr_bytes = || {
+            CertificateParams::default()
+                .serialize_request(&key)
+                .unwrap()
+                .der()
+                .to_vec()
+        };
+
+        // Operator mints a token on replica A.
+        let token = a
+            .mint_token(Request::new(MintTokenRequest { ttl_seconds: 0 }))
+            .await
+            .unwrap()
+            .into_inner()
+            .join_token;
+
+        // Agent enrolls via replica B: cross-replica single-use redeem + the
+        // shared CA issues the cert.
+        let enrolled = b
+            .enroll(Request::new(EnrollRequest {
+                join_token: token,
+                csr: csr_bytes(),
+            }))
+            .await
+            .expect("token minted on A must redeem on B")
+            .into_inner();
+
+        // Agent renews via replica A — A validates a cert that B issued (only
+        // possible because both share one CA) and reissues.
+        a.renew(Request::new(RenewRequest {
+            current_cert: enrolled.cert.clone(),
+            csr: csr_bytes(),
+        }))
+        .await
+        .expect("A must renew a cert that B issued (shared CA)");
+
+        // Operator revokes on A; the revocation is shared, so a renew via B is
+        // now refused.
+        a.revoke(Request::new(RevokeRequest {
+            host_id: enrolled.host_id,
+        }))
+        .await
+        .unwrap();
+        let err = b
+            .renew(Request::new(RenewRequest {
+                current_cert: enrolled.cert,
+                csr: csr_bytes(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "revoke on A must refuse renew on B"
+        );
+    }
 }
