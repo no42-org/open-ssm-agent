@@ -70,6 +70,8 @@ pub enum ExecError {
     },
     /// A non-empty `run_as` was requested on a platform where we cannot fully drop
     /// privileges (no `setgroups`). Fail closed rather than retain root's groups.
+    /// Only exists off the supported targets, where the fail-closed path builds it.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[error("dropping privileges to a run_as user is only supported on Linux")]
     PrivDropUnsupported,
     #[error("spawning {program:?} failed: {source}")]
