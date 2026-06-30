@@ -1682,4 +1682,218 @@ mod tests {
             a.abort();
         }
     }
+
+    // --- Sealed bidirectional KIND_STREAM transport over the real broker (Epic 4) ---
+
+    /// Prove the sealed stream transport end to end: a per-stream subkey (derived
+    /// from the session keys) seals `KIND_STREAM` frames that round-trip
+    /// **bidirectionally** through the untrusted broker on the new
+    /// `…/up|down/stream` topics, in order, with the stream's `seq` running from 0
+    /// (the key-independence from the control channel is proven separately by the
+    /// `seal` unit tests).
+    ///
+    /// Key agreement is run here via the osa-core primitives — the bridge already
+    /// proves the handshake over the broker in
+    /// `an_agent_completes_an_authenticated_session_over_the_broker`; this test
+    /// isolates the *stream* layer. The peer driving the coordinator side connects
+    /// within the host's tenant: in production the coordinator reaches these topics
+    /// via its tenant-exempt bridge link (wired for streams in story 4.1).
+    #[tokio::test]
+    async fn sealed_stream_frames_round_trip_bidirectionally_over_the_broker() {
+        use osa_core::seal::{Direction, Handshake};
+        use osa_core::topics;
+        use osa_core::wire;
+        use osa_proto::v1::Envelope;
+        use osa_proto::v1::envelope::Kind;
+
+        const SID: &str = "itest-stream-session";
+        const N: u64 = 3;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let server = ca.issue_server_cert(&["localhost"]).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+        std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+        std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+        let port = free_port();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        spawn(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            dir.path(),
+            ca.clone(),
+            Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        let host = HostId::new();
+        let host_str = host.0.to_string();
+
+        // Establish the session keys for both ends, then derive the per-stream
+        // subkey from each — the same stream_id yields matching keys.
+        let coord_hs = Handshake::new().unwrap();
+        let agent_hs = Handshake::new().unwrap();
+        let (coord_pub, agent_pub) = (coord_hs.public, agent_hs.public);
+        let coord_stream = coord_hs
+            .derive(&agent_pub, b"itest-stream-bind")
+            .unwrap()
+            .derive_stream(b"itest-stream");
+        let agent_stream = agent_hs
+            .derive(&coord_pub, b"itest-stream-bind")
+            .unwrap()
+            .derive_stream(b"itest-stream");
+
+        // Agent side: subscribe to the stream downlink and signal readiness once
+        // the SUBACK lands — so the coordinator never publishes into a topic the
+        // agent hasn't subscribed yet (QoS1 non-retained frames would be dropped).
+        // Then open each frame and echo the bytes back sealed on the uplink, which
+        // carries the stream's OWN monotonic seq from 0. The loop runs to its
+        // deadline (not stopping at N) so the eventloop keeps flushing the echoes
+        // it has enqueued; the coordinator aborts it once it has collected them.
+        let agent_identity = client_identity(&ca, host).await;
+        let agent_host = host_str.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent_task = tokio::spawn(async move {
+            let (ca_pem, cert, key) = agent_identity;
+            let mut opts = MqttOptions::new("stream-agent", "localhost", port);
+            opts.set_keep_alive(StdDuration::from_secs(30));
+            opts.set_transport(Transport::tls(ca_pem, Some((cert, key)), None));
+            let (client, mut eventloop) = AsyncClient::new(opts, 10);
+            let mut ready_tx = Some(ready_tx);
+            let mut up_seq = 0u64;
+            let deadline = std::time::Instant::now() + StdDuration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, eventloop.poll()).await {
+                    Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
+                        client
+                            .subscribe(topics::stream_down(&agent_host), QoS::AtLeastOnce)
+                            .await
+                            .unwrap();
+                    }
+                    Ok(Ok(Event::Incoming(Packet::SubAck(_)))) => {
+                        // Subscription is live: safe for the coordinator to publish.
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    Ok(Ok(Event::Incoming(Packet::Publish(p)))) => {
+                        if p.topic == topics::stream_down(&agent_host) {
+                            let env: Envelope = wire::decode(&p.payload).unwrap();
+                            let pt =
+                                wire::open_envelope(&agent_stream, Direction::CoordToAgent, &env)
+                                    .expect("agent opens the sealed downlink stream frame");
+                            let mut reply = b"echo:".to_vec();
+                            reply.extend_from_slice(&pt);
+                            let up = wire::seal_envelope(
+                                &agent_stream,
+                                Direction::AgentToCoord,
+                                &agent_host,
+                                SID,
+                                up_seq,
+                                Kind::Stream,
+                                &reply,
+                            );
+                            up_seq += 1;
+                            client
+                                .publish(
+                                    topics::stream_up(&agent_host),
+                                    QoS::AtLeastOnce,
+                                    false,
+                                    wire::encode(&up),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => panic!("agent stream eventloop error: {e:?}"),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Coordinator side: wait until the agent's subscription is live, then
+        // subscribe to the uplink, push N downlink frames (seq 0..N), and collect
+        // the echoes — dropping any replayed/stale seq the way the real session's
+        // high-water guard does, and decrypting the in-order bytes.
+        ready_rx
+            .await
+            .expect("agent must signal its subscription is live");
+        let (ca_pem, cert, key) = client_identity(&ca, host).await;
+        let mut opts = MqttOptions::new("stream-coord", "localhost", port);
+        opts.set_keep_alive(StdDuration::from_secs(30));
+        opts.set_transport(Transport::tls(ca_pem, Some((cert, key)), None));
+        let (client, mut eventloop) = AsyncClient::new(opts, 10);
+        let mut received: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut recv_high: Option<u64> = None;
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(8);
+        while (received.len() as u64) < N && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, eventloop.poll()).await {
+                Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
+                    client
+                        .subscribe(topics::stream_up(&host_str), QoS::AtLeastOnce)
+                        .await
+                        .unwrap();
+                    for i in 0..N {
+                        let env = wire::seal_envelope(
+                            &coord_stream,
+                            Direction::CoordToAgent,
+                            &host_str,
+                            SID,
+                            i,
+                            Kind::Stream,
+                            format!("k{i}").as_bytes(),
+                        );
+                        client
+                            .publish(
+                                topics::stream_down(&host_str),
+                                QoS::AtLeastOnce,
+                                false,
+                                wire::encode(&env),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+                Ok(Ok(Event::Incoming(Packet::Publish(p)))) => {
+                    if p.topic == topics::stream_up(&host_str) {
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        // Strict high-water guard (the real session guard): drop a
+                        // replayed/stale seq rather than counting it twice — a QoS1
+                        // duplicate must not break the round-trip.
+                        if recv_high.is_some_and(|h| env.seq <= h) {
+                            continue;
+                        }
+                        recv_high = Some(env.seq);
+                        let pt = wire::open_envelope(&coord_stream, Direction::AgentToCoord, &env)
+                            .expect("coordinator opens the sealed uplink stream frame");
+                        received.push((env.seq, pt));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("coordinator stream eventloop error: {e:?}"),
+                Err(_) => break,
+            }
+        }
+
+        agent_task.abort();
+
+        assert_eq!(
+            received.len() as u64,
+            N,
+            "every sealed stream frame must round-trip bidirectionally over the broker"
+        );
+        for (i, (seq, pt)) in received.iter().enumerate() {
+            assert_eq!(*seq, i as u64, "the stream owns its own seq counter from 0");
+            assert_eq!(
+                pt,
+                format!("echo:k{i}").as_bytes(),
+                "the per-stream subkey decrypts the echoed bytes in order"
+            );
+        }
+    }
 }
