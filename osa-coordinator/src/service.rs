@@ -495,14 +495,25 @@ mod tests {
         )
     }
 
-    /// A `DispatchRequest` for `kind` against `target`, carrying `subject` in the
-    /// request extensions the way the auth interceptor would.
+    /// A `DispatchRequest` for `kind` against `target` as the default identity
+    /// (empty `run_as`), carrying `subject` in the request extensions the way the
+    /// auth interceptor would.
     fn dispatch_req(subject: Option<&str>, kind: &str, target: &str) -> Request<DispatchRequest> {
+        dispatch_req_as(subject, kind, target, "")
+    }
+
+    /// As [`dispatch_req`], but with an explicit `run_as` (the #22 axis).
+    fn dispatch_req_as(
+        subject: Option<&str>,
+        kind: &str,
+        target: &str,
+        run_as: &str,
+    ) -> Request<DispatchRequest> {
         let mut req = Request::new(DispatchRequest {
             action: Some(osa_proto::v1::ActionDescriptor {
                 kind: kind.into(),
                 target: target.into(),
-                run_as: String::new(),
+                run_as: run_as.into(),
                 params_hash: Vec::new(),
             }),
             params: Vec::new(),
@@ -704,6 +715,7 @@ mod tests {
                 subject = "alice@example"
                 verbs = ["exec"]
                 selectors = ["*"]
+                run_as = ["*"]
             "#,
             )
             .unwrap(),
@@ -726,6 +738,7 @@ mod tests {
                 subject = "alice@example"
                 verbs = ["exec"]
                 selectors = ["*"]
+                run_as = ["*"]
             "#,
             )
             .unwrap(),
@@ -745,6 +758,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_enforces_run_as() {
+        // Grants exec on any host, but only as `deploy` (#22): the action's
+        // run_as must reach the PDP through the dispatch path.
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["exec"]
+                selectors = ["*"]
+                run_as = ["deploy"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let svc = service_with_policy(policy);
+        // The granted run_as is allowed.
+        assert!(
+            svc.dispatch(dispatch_req_as(
+                Some("alice@example"),
+                "exec",
+                HOST,
+                "deploy"
+            ))
+            .await
+            .is_ok()
+        );
+        // A run_as outside the grant is denied.
+        let err = svc
+            .dispatch(dispatch_req_as(Some("alice@example"), "exec", HOST, "root"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // The default identity (empty run_as) is not implicitly granted.
+        let err = svc
+            .dispatch(dispatch_req(Some("alice@example"), "exec", HOST))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
     async fn dispatch_without_a_subject_is_anonymous_and_denied() {
         // No bound Subject (auth disabled) → "anonymous", which has no grants.
         let policy = Arc::new(
@@ -754,6 +809,7 @@ mod tests {
                 subject = "alice@example"
                 verbs = ["*"]
                 selectors = ["*"]
+                run_as = ["*"]
             "#,
             )
             .unwrap(),
@@ -797,6 +853,7 @@ mod tests {
                 subject = "alice@example"
                 verbs = ["exec"]
                 selectors = ["*"]
+                run_as = ["*"]
             "#,
             )
             .unwrap(),
@@ -843,6 +900,7 @@ mod tests {
                 subject = "alice@example"
                 verbs = ["exec"]
                 selectors = ["*"]
+                run_as = ["*"]
             "#,
             )
             .unwrap(),
