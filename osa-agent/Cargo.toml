@@ -20,12 +20,15 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "crypto", "ring"] }
 rumqttc = "0.25.1"
 rustls = "0.23"
 pem = "3"
 x509-parser = { version = "0.18.1", features = ["verify"] }
 uuid.workspace = true
+# Resolve a run_as user to uid/gid and drop privileges before exec (AD-14).
+nix = { version = "0.29", default-features = false, features = ["user"] }
 serde.workspace = true
 # Host-local allowlist document (AD-20); operator-editable.
 toml = "0.8"

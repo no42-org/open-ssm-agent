@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod backstop;
 mod control_channel;
 mod enroll;
+mod exec;
 mod session;
 
 #[derive(Parser)]
@@ -89,6 +90,18 @@ enum Command {
         #[arg(long, env = "OSA_STATE_DIR", default_value = "/var/lib/osa")]
         state_dir: PathBuf,
     },
+    /// Run a command locally under `run_as` and report its output + exit status —
+    /// validate the exec capability and privilege drop on this host before relying
+    /// on dispatched execution (parallels `check`). The agent must be able to drop
+    /// to `run_as` (typically run as root) for a non-empty `--run-as`.
+    Exec {
+        /// Target unix user; empty runs as the agent's own user.
+        #[arg(long, default_value = "")]
+        run_as: String,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -137,6 +150,27 @@ async fn main() -> anyhow::Result<()> {
             // Renew the cert in the background as it nears expiry.
             tokio::spawn(enroll::renewal_loop(coordinator, state_dir.clone()));
             control_channel::run(&state_dir, &broker_host, broker_port).await?;
+        }
+        Command::Exec { run_as, argv } => {
+            use std::io::Write;
+            let outcome = exec::run(argv, run_as).await?;
+            tracing::info!(kind = exec::KIND, "exec finished");
+            // Mirror the captured streams, then exit with the child's status. Write
+            // errors (e.g. a closed pipe) must not replace the real exit code, and
+            // stdout (a line-buffered LineWriter) must be flushed before the
+            // `process::exit` below skips destructors.
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(&outcome.stdout);
+            let _ = stdout.flush();
+            let _ = std::io::stderr().write_all(&outcome.stderr);
+            match (outcome.exit_code, outcome.signal) {
+                (Some(code), _) => std::process::exit(code),
+                (None, Some(sig)) => {
+                    eprintln!("terminated by signal {sig}");
+                    std::process::exit(128 + sig);
+                }
+                (None, None) => std::process::exit(1),
+            }
         }
         Command::Check {
             allowlist,
