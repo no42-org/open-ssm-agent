@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 mod backstop;
 mod control_channel;
+mod dispatch;
 mod enroll;
 mod exec;
 mod session;
@@ -142,14 +143,14 @@ async fn main() -> anyhow::Result<()> {
             broker_port,
             allowlist,
         } => {
-            // Load the host backstop (AD-20) and announce it. The capability
-            // dispatcher (Epic 3) evaluates every dispatched action through it
-            // before any side effect; today the agent serves only heartbeats.
-            let backstop = backstop::load(allowlist.as_deref())?;
+            // Load the host backstop (AD-20) and announce it. The dispatch job
+            // runner (Epic 3) evaluates every dispatched action through it before
+            // any side effect.
+            let backstop = std::sync::Arc::new(backstop::load(allowlist.as_deref())?);
             backstop::log_active(&backstop);
             // Renew the cert in the background as it nears expiry.
             tokio::spawn(enroll::renewal_loop(coordinator, state_dir.clone()));
-            control_channel::run(&state_dir, &broker_host, broker_port).await?;
+            control_channel::run(&state_dir, &broker_host, broker_port, backstop).await?;
         }
         Command::Exec { run_as, argv } => {
             use std::io::Write;

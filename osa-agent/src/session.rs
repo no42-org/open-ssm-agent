@@ -17,6 +17,8 @@
 //! [`crate::control_channel`].
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use osa_core::handshake::Initiator;
@@ -72,10 +74,81 @@ pub struct Handshaking {
     sid: String,
 }
 
-/// A live session: the per-direction keys and the `sid` they were bound to.
+/// A live session: the per-direction keys, the `sid` they were bound to, the
+/// monotonic uplink `seq` allocator, and the downlink replay guard.
+///
+/// `keys` and `send_seq` are shared (`Arc`) so concurrent job tasks can each seal
+/// uplink envelopes with a **unique** `seq` (the AES-GCM nonce) — atomic
+/// allocation is what keeps the per-direction nonce unique by construction.
 pub struct Established {
-    keys: SessionKeys,
+    keys: Arc<SessionKeys>,
     sid: String,
+    /// Next uplink (agent→coordinator) `seq`. The session-open ack takes 0; sealed
+    /// results take 1, 2, … — allocated atomically across all job tasks.
+    send_seq: Arc<AtomicU64>,
+    /// Highest downlink (coordinator→agent) `seq` accepted, for replay rejection.
+    /// `None` until the first downlink message (the beacon at seq 0).
+    recv_high: Option<u64>,
+}
+
+impl Established {
+    /// A cloneable handle to the session keys (for a spawned job task).
+    pub fn keys(&self) -> Arc<SessionKeys> {
+        Arc::clone(&self.keys)
+    }
+
+    /// A cloneable handle to the uplink `seq` allocator (for a spawned job task).
+    pub fn send_seq(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.send_seq)
+    }
+
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
+    /// Accept a downlink `seq` if it is newer than every one seen, updating the
+    /// high-water mark. Rejects a replayed or out-of-order (≤ high) `seq`.
+    fn accept_recv(&mut self, seq: u64) -> bool {
+        if self.recv_high.is_some_and(|h| seq <= h) {
+            return false;
+        }
+        self.recv_high = Some(seq);
+        true
+    }
+
+    /// Open a sealed downlink envelope and enforce the replay guard, in the
+    /// security-critical order: **authenticate first** (AEAD open, which also binds
+    /// the cleartext `sid`/`seq` via the AAD), then advance the replay high-water
+    /// mark. Returns the plaintext, or `None` if the tag fails OR the `seq` is a
+    /// replay/stale. Authenticating first is what stops an untrusted broker from
+    /// poisoning the high-water mark with a forged (unopenable) envelope to wedge
+    /// the channel — a rejected forgery never touches `recv_high`.
+    pub fn open_downlink(&mut self, env: &Envelope) -> Option<Vec<u8>> {
+        let plaintext = wire::open_envelope(&self.keys, Direction::CoordToAgent, env).ok()?;
+        self.accept_recv(env.seq).then_some(plaintext)
+    }
+}
+
+/// Seal `payload` as the next uplink envelope and return its encoded bytes ready
+/// to publish. Allocates the `seq` atomically from `send_seq` (unique nonce).
+pub fn seal_uplink(
+    keys: &SessionKeys,
+    send_seq: &AtomicU64,
+    host_id: &str,
+    sid: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let seq = send_seq.fetch_add(1, Ordering::Relaxed);
+    let env = wire::seal_envelope(
+        keys,
+        Direction::AgentToCoord,
+        host_id,
+        sid,
+        seq,
+        Kind::Control,
+        payload,
+    );
+    wire::encode(&env)
 }
 
 /// Begin a session: mint a fresh `sid`, build and sign the `ClientHello`. Returns
@@ -115,34 +188,40 @@ pub fn finish_handshake(
         .initiator
         .finish(&server_eph, &sh.sig, &id.ca_pubkey_sec1)
         .context("ServerHello did not verify against the pinned CA")?;
-    Ok(Established { keys, sid: hs.sid })
+    Ok(Established {
+        keys: Arc::new(keys),
+        sid: hs.sid,
+        send_seq: Arc::new(AtomicU64::new(0)),
+        recv_high: None,
+    })
 }
 
 /// Open the coordinator's sealed session-ready beacon and, if it is the expected
-/// payload, return the encoded sealed ack to publish on the control uplink.
+/// payload, return the encoded sealed ack to publish on the control uplink. The
+/// beacon's downlink `seq` (0) is recorded so a later dispatch must be newer.
 pub fn confirm_session(
-    est: &Established,
+    est: &mut Established,
     id: &AgentIdentity,
     beacon: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let env: Envelope = wire::decode(beacon).context("decoding session-ready beacon")?;
     anyhow::ensure!(env.sid == est.sid, "beacon sid does not match this session");
-    let payload = wire::open_envelope(&est.keys, Direction::CoordToAgent, &env)
-        .map_err(|_| anyhow::anyhow!("session-ready beacon failed to open — key mismatch"))?;
+    // Authenticate the beacon before advancing the replay guard (open_downlink),
+    // so a forged beacon cannot poison the high-water mark.
+    let payload = est
+        .open_downlink(&env)
+        .ok_or_else(|| anyhow::anyhow!("session-ready beacon failed to open or was replayed"))?;
     anyhow::ensure!(
         payload == wire::CTRL_SESSION_READY,
         "unexpected sealed control payload"
     );
-    let ack = wire::seal_envelope(
+    Ok(seal_uplink(
         &est.keys,
-        Direction::AgentToCoord,
+        &est.send_seq,
         &id.host_id,
         &est.sid,
-        0,
-        Kind::Control,
         wire::CTRL_SESSION_ACK,
-    );
-    Ok(wire::encode(&ack))
+    ))
 }
 
 /// Decode PEM bytes into the wrapped DER content.
@@ -240,7 +319,7 @@ mod tests {
             server_eph: resp.server_eph.to_vec(),
             sig: resp.sig.clone(),
         };
-        let est = finish_handshake(hs, &id, &wire::encode(&server_hello)).unwrap();
+        let mut est = finish_handshake(hs, &id, &wire::encode(&server_hello)).unwrap();
 
         // Coordinator seals the ready beacon; the agent opens it and replies.
         let beacon = wire::seal_envelope(
@@ -252,7 +331,7 @@ mod tests {
             Kind::Control,
             wire::CTRL_SESSION_READY,
         );
-        let ack_bytes = confirm_session(&est, &id, &wire::encode(&beacon)).unwrap();
+        let ack_bytes = confirm_session(&mut est, &id, &wire::encode(&beacon)).unwrap();
 
         // The coordinator opens the agent's ack with its own session keys.
         let ack: Envelope = wire::decode(&ack_bytes).unwrap();
@@ -291,7 +370,7 @@ mod tests {
             server_eph: resp.server_eph.to_vec(),
             sig: resp.sig.clone(),
         };
-        let est = finish_handshake(hs, &id, &wire::encode(&server_hello)).unwrap();
+        let mut est = finish_handshake(hs, &id, &wire::encode(&server_hello)).unwrap();
         // A beacon bound to a different sid is refused (no cross-session splice).
         let beacon = wire::seal_envelope(
             &resp.keys,
@@ -302,6 +381,76 @@ mod tests {
             Kind::Control,
             wire::CTRL_SESSION_READY,
         );
-        assert!(confirm_session(&est, &id, &wire::encode(&beacon)).is_err());
+        assert!(confirm_session(&mut est, &id, &wire::encode(&beacon)).is_err());
+    }
+
+    /// A session key pair (agent half, coordinator half) deriving identical keys.
+    fn key_pair() -> (SessionKeys, SessionKeys) {
+        use osa_core::seal::Handshake;
+        let a = Handshake::new().unwrap();
+        let b = Handshake::new().unwrap();
+        let (apub, bpub) = (a.public, b.public);
+        (
+            a.derive(&bpub, b"bind").unwrap(),
+            b.derive(&apub, b"bind").unwrap(),
+        )
+    }
+
+    fn established(keys: SessionKeys) -> Established {
+        Established {
+            keys: Arc::new(keys),
+            sid: "s".into(),
+            send_seq: Arc::new(AtomicU64::new(0)),
+            recv_high: None,
+        }
+    }
+
+    #[test]
+    fn accept_recv_rejects_replays_and_stale_seqs() {
+        let (agent, _) = key_pair();
+        let mut est = established(agent);
+        assert!(est.accept_recv(0), "first (beacon) accepted");
+        assert!(!est.accept_recv(0), "replay of 0 rejected");
+        assert!(est.accept_recv(1), "next dispatch accepted");
+        assert!(!est.accept_recv(1), "replay of 1 rejected");
+        assert!(!est.accept_recv(0), "stale seq rejected");
+        assert!(est.accept_recv(2), "newer accepted");
+    }
+
+    #[test]
+    fn open_downlink_authenticates_before_advancing_the_replay_guard() {
+        let (agent, coord) = key_pair();
+        let (foreign, _) = key_pair(); // an unrelated session's keys
+        let mut est = established(agent);
+
+        // A forged high-seq envelope that does NOT open (sealed by a foreign key).
+        // It must be rejected AND must not poison the replay high-water mark.
+        let forged = wire::seal_envelope(
+            &foreign,
+            Direction::CoordToAgent,
+            "s",
+            "s",
+            u64::MAX,
+            Kind::Control,
+            b"x",
+        );
+        assert!(
+            est.open_downlink(&forged).is_none(),
+            "forgery must not open"
+        );
+
+        // The guard was not poisoned: a legitimate beacon at seq 0 still opens.
+        let real = wire::seal_envelope(
+            &coord,
+            Direction::CoordToAgent,
+            "s",
+            "s",
+            0,
+            Kind::Control,
+            b"hi",
+        );
+        assert_eq!(est.open_downlink(&real).as_deref(), Some(&b"hi"[..]));
+        // A replay of that (now-seen) seq is rejected.
+        assert!(est.open_downlink(&real).is_none(), "replay rejected");
     }
 }

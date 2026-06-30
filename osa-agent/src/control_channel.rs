@@ -9,17 +9,32 @@
 //! it was issued at enrollment and pinning the CA root it was given. It never
 //! listens — the host exposes no inbound port. On disconnect it reconnects with
 //! bounded exponential backoff plus per-host jitter (so a fleet does not
-//! reconnect in lockstep). Publishing / heartbeat land in the next slice.
+//! reconnect in lockstep). On connect it publishes heartbeats (AD-9), opens the
+//! authenticated session (#20), and runs sealed `Dispatch`es as spawned jobs that
+//! stream sealed results back (Epic 3).
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use osa_core::allowlist::LocalAllowlist;
+use osa_proto::v1::{Dispatch, Envelope};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 
+use crate::dispatch::{self, JobChannel};
 use crate::session::{AgentIdentity, Established, Handshaking};
+
+/// Bound on undelivered sealed job-result bytes queued for the publisher; the job
+/// runner backpressures on `send().await` rather than dropping output.
+const RESULT_QUEUE: usize = 256;
+/// Cap on concurrently-running dispatched jobs (and thus child processes) per
+/// agent. A compromised coordinator could otherwise stream distinct-seq dispatches
+/// to fork-bomb the host; the backstop gates kind/run_as, this gates count (AD-20).
+const MAX_CONCURRENT_JOBS: usize = 16;
 
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -82,12 +97,19 @@ fn backoff(attempt: u32, seed: u64) -> Duration {
 /// Run the control channel forever: connect over mTLS, drive the event loop, and
 /// reconnect with backoff on any failure. Returns only on an unrecoverable setup
 /// error (e.g. missing identity).
-pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyhow::Result<()> {
+pub async fn run(
+    state_dir: &Path,
+    broker_host: &str,
+    broker_port: u16,
+    backstop: Arc<LocalAllowlist>,
+) -> anyhow::Result<()> {
     // Fail fast if the host is not enrolled; the host_id is stable.
     let host_id = read_host_id(state_dir)?;
     load_identity(state_dir)?;
     let seed = stable_seed(&host_id);
     let heartbeat_topic = osa_core::topics::heartbeat(&host_id);
+    // Caps concurrent jobs across the agent's whole lifetime (survives reconnects).
+    let job_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
     tracing::info!(%host_id, broker = %format!("{broker_host}:{broker_port}"), "control channel: dialing broker (mTLS, outbound-only)");
 
     let mut attempt = 0u32;
@@ -124,6 +146,16 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
         let topics = SessionTopics::for_host(&host_id);
         let mut handshaking: Option<Handshaking> = None;
         let mut session: Option<Established> = None;
+        // Job tasks seal results and hand the bytes to a dedicated publisher task,
+        // so a long/high-output job never blocks the event loop and backpressures
+        // instead of dropping output. The publisher ends when this connection's
+        // sender and all job clones drop.
+        let (results_tx, results_rx) = mpsc::channel::<Vec<u8>>(RESULT_QUEUE);
+        tokio::spawn(publish_results(
+            client.clone(),
+            results_rx,
+            topics.result_up.clone(),
+        ));
 
         let mut connected_at: Option<Instant> = None;
         loop {
@@ -147,6 +179,9 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
                             &p.payload,
                             &client,
                             &agent_id,
+                            &backstop,
+                            &job_permits,
+                            &results_tx,
                             &topics,
                             &mut handshaking,
                             &mut session,
@@ -207,6 +242,8 @@ struct SessionTopics {
     hs_down: String,
     ctrl_up: String,
     ctrl_down: String,
+    dispatch_down: String,
+    result_up: String,
 }
 
 impl SessionTopics {
@@ -216,6 +253,8 @@ impl SessionTopics {
             hs_down: osa_core::topics::hs_down(host_id),
             ctrl_up: osa_core::topics::ctrl_up(host_id),
             ctrl_down: osa_core::topics::ctrl_down(host_id),
+            dispatch_down: osa_core::topics::dispatch_down(host_id),
+            result_up: osa_core::topics::result_up(host_id),
         }
     }
 }
@@ -238,6 +277,10 @@ fn begin_handshake(
         tracing::warn!(error = %e, "control channel: subscribing control downlink failed");
         return None;
     }
+    if let Err(e) = client.try_subscribe(topics.dispatch_down.clone(), QoS::AtLeastOnce) {
+        tracing::warn!(error = %e, "control channel: subscribing dispatch downlink failed");
+        return None;
+    }
     let (hs, hello) = match crate::session::start_handshake(id) {
         Ok(v) => v,
         Err(e) => {
@@ -254,12 +297,17 @@ fn begin_handshake(
 }
 
 /// Route an incoming Publish: a `ServerHello` finishes the handshake; the sealed
-/// session-ready beacon is opened and acked, confirming the E2E channel (#20).
+/// session-ready beacon is opened and acked (#20); a sealed `Dispatch` is opened
+/// and run as a spawned job streaming sealed results (Epic 3).
+#[allow(clippy::too_many_arguments)]
 fn on_publish(
     topic: &str,
     payload: &[u8],
     client: &AsyncClient,
     id: &AgentIdentity,
+    backstop: &Arc<LocalAllowlist>,
+    job_permits: &Arc<Semaphore>,
+    results: &mpsc::Sender<Vec<u8>>,
     topics: &SessionTopics,
     handshaking: &mut Option<Handshaking>,
     session: &mut Option<Established>,
@@ -277,7 +325,7 @@ fn on_publish(
             Err(e) => tracing::warn!(error = %e, "control channel: ServerHello rejected"),
         }
     } else if topic == topics.ctrl_down {
-        let Some(est) = session.as_ref() else {
+        let Some(est) = session.as_mut() else {
             tracing::warn!("control channel: sealed control before a session — ignoring");
             return;
         };
@@ -295,7 +343,86 @@ fn on_publish(
             }
             Err(e) => tracing::warn!(error = %e, "control channel: session beacon rejected"),
         }
+    } else if topic == topics.dispatch_down {
+        let Some(est) = session.as_mut() else {
+            tracing::warn!("control channel: dispatch before a session — ignoring");
+            return;
+        };
+        handle_dispatch(est, id, backstop, job_permits, results, payload);
     }
+}
+
+/// Drain sealed job-result bytes and publish them on the result uplink with
+/// backpressure (`publish().await`), so output is delivered rather than dropped.
+/// Ends when the connection's sender and all job clones drop, or on a publish
+/// error (e.g. the link went away).
+async fn publish_results(client: AsyncClient, mut rx: mpsc::Receiver<Vec<u8>>, topic: String) {
+    while let Some(bytes) = rx.recv().await {
+        if let Err(e) = client
+            .publish(topic.clone(), QoS::AtLeastOnce, false, bytes)
+            .await
+        {
+            tracing::warn!(error = %e, "control channel: result publish failed — stopping publisher");
+            break;
+        }
+    }
+}
+
+/// Open a sealed `Dispatch` against the live session and spawn it as a job that
+/// streams sealed results. Rejects a replayed/stale downlink `seq` (anti
+/// double-execution) before opening. Spawned so a long command never blocks the
+/// event loop.
+fn handle_dispatch(
+    est: &mut Established,
+    id: &AgentIdentity,
+    backstop: &Arc<LocalAllowlist>,
+    job_permits: &Arc<Semaphore>,
+    results: &mpsc::Sender<Vec<u8>>,
+    payload: &[u8],
+) {
+    let env: Envelope = match osa_core::wire::decode(payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "control channel: malformed dispatch envelope — dropping");
+            return;
+        }
+    };
+    // Authenticate first, then enforce the replay guard (open_downlink): a forged
+    // envelope can neither be acted on nor poison the replay high-water mark.
+    let Some(plaintext) = est.open_downlink(&env) else {
+        tracing::warn!(
+            seq = env.seq,
+            "control channel: dispatch did not open or was replayed — dropping"
+        );
+        return;
+    };
+    let dispatch: Dispatch = match osa_core::wire::decode(&plaintext) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "control channel: undecodable dispatch — dropping");
+            return;
+        }
+    };
+    // Bound concurrent jobs/children. Shed (don't queue) at capacity so a
+    // compromised coordinator cannot fork-bomb the host; a legitimate operator
+    // sees a timeout and can retry.
+    let Ok(permit) = Arc::clone(job_permits).try_acquire_owned() else {
+        tracing::warn!(job_id = %dispatch.job_id, "control channel: at job capacity — shedding dispatch");
+        return;
+    };
+    tracing::info!(job_id = %dispatch.job_id, kind = %dispatch.kind, "control channel: dispatch received");
+    let channel = JobChannel {
+        results: results.clone(),
+        keys: est.keys(),
+        send_seq: est.send_seq(),
+        host_id: id.host_id.clone(),
+        sid: est.sid().to_string(),
+    };
+    let backstop = Arc::clone(backstop);
+    tokio::spawn(async move {
+        let _permit = permit; // held for the job's life; frees a slot on completion
+        dispatch::run_job(dispatch, backstop, channel).await;
+    });
 }
 
 #[cfg(test)]

@@ -31,6 +31,9 @@ pub const HS_UP_FILTER: &str = "/tenants/+/osa/v1/up/hs";
 /// ack, #20).
 pub const CTRL_UP_FILTER: &str = "/tenants/+/osa/v1/up/ctrl";
 
+/// Filter matching every host's sealed job-result uplink (Epic 3).
+pub const RESULT_UP_FILTER: &str = "/tenants/+/osa/v1/up/result";
+
 /// The broker tenant id for a host: its `host_id` with hyphens stripped, so it is
 /// alphanumeric as `validate-tenant-prefix` requires. Must equal the cert's O.
 pub fn tenant(host_id: &str) -> String {
@@ -71,6 +74,18 @@ pub fn ctrl_down(host_id: &str) -> String {
     format!("{}{ROOT}/down/ctrl", tenant_prefix(host_id))
 }
 
+/// The sealed dispatch downlink: the coordinator publishes sealed `Dispatch`
+/// messages here, and the agent subscribes to it (Epic 3).
+pub fn dispatch_down(host_id: &str) -> String {
+    format!("{}{ROOT}/down/dispatch", tenant_prefix(host_id))
+}
+
+/// The sealed result uplink: the agent publishes sealed `Result` messages here,
+/// and the coordinator subscribes across all tenants via [`RESULT_UP_FILTER`].
+pub fn result_up(host_id: &str) -> String {
+    format!("{}{ROOT}/up/result", tenant_prefix(host_id))
+}
+
 /// Extract the tenant id (hyphen-stripped host_id) from a topic whose tail after
 /// the tenant segment equals `tail`. The broker confines each client to its own
 /// `/tenants/<O>/…` subtree, so a topic matching the scheme names the tenant that
@@ -94,6 +109,11 @@ pub fn tenant_from_hs_up(topic: &str) -> Option<&str> {
 /// Extract the tenant id from a sealed control uplink topic (#20).
 pub fn tenant_from_ctrl_up(topic: &str) -> Option<&str> {
     tenant_for_tail(topic, "osa/v1/up/ctrl")
+}
+
+/// Extract the tenant id from a sealed job-result uplink topic (Epic 3).
+pub fn tenant_from_result_up(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/result")
 }
 
 #[cfg(test)]
@@ -156,11 +176,18 @@ mod tests {
         assert_eq!(hs_down(host), format!("/tenants/{t}/osa/v1/down/hs"));
         assert_eq!(ctrl_up(host), format!("/tenants/{t}/osa/v1/up/ctrl"));
         assert_eq!(ctrl_down(host), format!("/tenants/{t}/osa/v1/down/ctrl"));
+        assert_eq!(
+            dispatch_down(host),
+            format!("/tenants/{t}/osa/v1/down/dispatch")
+        );
+        assert_eq!(result_up(host), format!("/tenants/{t}/osa/v1/up/result"));
         assert_eq!(tenant_from_hs_up(&hs_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_ctrl_up(&ctrl_up(host)), Some(t.as_str()));
+        assert_eq!(tenant_from_result_up(&result_up(host)), Some(t.as_str()));
         // The filters match the produced shapes.
         assert_eq!(HS_UP_FILTER, "/tenants/+/osa/v1/up/hs");
         assert_eq!(CTRL_UP_FILTER, "/tenants/+/osa/v1/up/ctrl");
+        assert_eq!(RESULT_UP_FILTER, "/tenants/+/osa/v1/up/result");
     }
 
     #[test]
