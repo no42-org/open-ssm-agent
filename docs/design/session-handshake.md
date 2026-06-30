@@ -84,9 +84,20 @@ mints a fresh `sid` + ephemerals → fresh keys, so `seq` may restart at 0.
   ephemeral ECDSA keys. No cert-chain logic (that needs x509-parser, a bin dep).
 - **Coordinator + agent bins (#20b):** cert-chain verification + host_id
   extraction (already have x509-parser + the CA), loading the identity/CA key to
-  sign, and the MQTT uplink/downlink flow + a per-session manager. The agent
-  subscribes to `/tenants/<host>/osa/v1/down`; the coordinator's bridge publishes
-  ServerHello + sealed dispatches there.
+  sign, and the MQTT uplink/downlink flow + a per-session manager. Split into two
+  slices:
+  - **Slice 1 (done): session establishment goes live.** The agent runs the
+    `Initiator` on connect and publishes a `ClientHello` on `…/up/hs`; the
+    coordinator's in-process broker **bridge** verifies the cert (chain + validity
+    + tenant-binding + revocation), runs `respond`, keeps a per-host `SessionStore`,
+    publishes the `ServerHello` on `…/down/hs`, and seals a session-ready beacon on
+    `…/down/ctrl`; the agent opens it and replies with a sealed ack on `…/up/ctrl`.
+    The MQTT codec + AAD live in `osa-core::wire`; the topics in `osa-core::topics`.
+    Proven E2E by a real-broker integration test.
+  - **Slice 2 (pending, rides with Epic 3.1/3.2): wire `Dispatch`** to seal an
+    `ActionDescriptor` to the agent over the established session and stream the
+    result back (needs the agent's exec capability to be meaningful), with the
+    monotonic per-direction `seq` management the streaming path requires.
 
 ## Signing-key posture (a known tradeoff)
 

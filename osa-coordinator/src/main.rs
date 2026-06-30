@@ -35,6 +35,7 @@ mod jwks;
 mod policy;
 mod revocation;
 mod service;
+mod session;
 mod token;
 
 /// Validity of issued host certificates — short-lived; renewed per AD-11/AD-28.
@@ -165,25 +166,6 @@ async fn main() -> anyhow::Result<()> {
         None => ca::EmbeddedCa::new(HOST_CERT_TTL)?,
     });
 
-    // Stand up the embedded mTLS broker: issue its server cert from the CA (so an
-    // agent that pinned the CA root trusts it) and write the TLS material to a
-    // private temp dir the broker reads. `cert_dir` is held for the process life.
-    let cert_dir = tempfile::TempDir::new().context("creating broker cert dir")?;
-    let dns: Vec<&str> = cli.broker_dns.iter().map(String::as_str).collect();
-    let server_cert = ca.issue_server_cert(&dns)?;
-    std::fs::write(
-        cert_dir.path().join(broker::BROKER_CERT),
-        &server_cert.cert_pem,
-    )?;
-    write_secret(
-        &cert_dir.path().join(broker::BROKER_KEY),
-        &server_cert.key_pem,
-    )?;
-    std::fs::write(cert_dir.path().join(broker::CA_CERT), ca.ca_root_pem())?;
-    broker::spawn(mqtt_addr, cert_dir.path())?;
-    wait_until_listening(mqtt_addr).await?;
-    tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) listening");
-
     let (tokens, revocations, audit): (
         Arc<dyn token::JoinTokens>,
         Arc<dyn revocation::Revocations>,
@@ -200,6 +182,28 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(audit_log::MemoryAuditLog::new()),
         ),
     };
+
+    // Stand up the embedded mTLS broker + coordinator bridge (#20): issue the
+    // broker's server cert from the CA (so an agent that pinned the CA root trusts
+    // it) and write the TLS material to a private temp dir the broker reads. The
+    // bridge verifies host certs and drives the session handshake, so it needs the
+    // CA and the revocation store. `cert_dir` is held for the process life.
+    let cert_dir = tempfile::TempDir::new().context("creating broker cert dir")?;
+    let dns: Vec<&str> = cli.broker_dns.iter().map(String::as_str).collect();
+    let server_cert = ca.issue_server_cert(&dns)?;
+    std::fs::write(
+        cert_dir.path().join(broker::BROKER_CERT),
+        &server_cert.cert_pem,
+    )?;
+    write_secret(
+        &cert_dir.path().join(broker::BROKER_KEY),
+        &server_cert.key_pem,
+    )?;
+    std::fs::write(cert_dir.path().join(broker::CA_CERT), ca.ca_root_pem())?;
+    broker::spawn(mqtt_addr, cert_dir.path(), ca.clone(), revocations.clone())?;
+    wait_until_listening(mqtt_addr).await?;
+    tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) + session bridge listening");
+
     let policy = build_policy_engine(&cli)?;
     let operator =
         service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);

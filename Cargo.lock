@@ -2224,6 +2224,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-parser 0.18.1",
 ]
 
@@ -2283,6 +2284,7 @@ dependencies = [
  "jsonwebtoken",
  "osa-proto",
  "p256",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

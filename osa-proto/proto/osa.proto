@@ -29,6 +29,25 @@ message Envelope {
   bytes ciphertext = 5; // AEAD-sealed payload (AD-27)
 }
 
+// Authenticated session handshake (AD-27, #20), per
+// docs/design/session-handshake.md. Carried as **cleartext** protobuf on the
+// per-host handshake topics (`…/up/hs`, `…/down/hs`) — the handshake establishes
+// the seal's keys, so its own messages cannot be sealed; they are authenticated
+// by the ECDSA P-256 signatures and bound to a fresh per-session `sid`.
+message ClientHello {
+  string sid = 1;       // fresh, unique per-session id (CSPRNG, the caller's job)
+  bytes client_eph = 2; // 32-byte X25519 ephemeral public key
+  bytes cert_der = 3;   // the agent's CA-signed cert (identity + chain to verify)
+  bytes sig = 4;        // ECDSA P-256(agent key) over the client transcript
+}
+
+// Coordinator's reply to a ClientHello (see ClientHello).
+message ServerHello {
+  string sid = 1;       // echoes the ClientHello sid
+  bytes server_eph = 2; // 32-byte X25519 ephemeral public key
+  bytes sig = 3;        // ECDSA P-256(CA key) over the server transcript
+}
+
 // Typed action descriptor (AD-12). The coordinator authorizes on this and
 // routes by it, but NEVER parses the capability payload. `run_as` lives here so
 // the PolicyEngine (AD-19) and the agent-local backstop (AD-20) can constrain

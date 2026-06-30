@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod backstop;
 mod control_channel;
 mod enroll;
+mod session;
 
 #[derive(Parser)]
 #[command(

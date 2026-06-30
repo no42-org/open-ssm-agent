@@ -19,6 +19,8 @@ use anyhow::Context;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tokio::time::sleep;
 
+use crate::session::{AgentIdentity, Established, Handshaking};
+
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -106,6 +108,23 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
         // Liveness semantics: after a stall, send one heartbeat, not a catch-up burst.
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Re-load the identity for the session handshake each connection so a cert
+        // renewed on disk is adopted (#20). A load failure here is unexpected (the
+        // mTLS identity above already loaded), so back off and retry.
+        let agent_id = match AgentIdentity::load(state_dir) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "control channel: cannot load identity for handshake");
+                let wait = backoff(attempt, seed);
+                attempt = attempt.saturating_add(1);
+                sleep(wait).await;
+                continue;
+            }
+        };
+        let topics = SessionTopics::for_host(&host_id);
+        let mut handshaking: Option<Handshaking> = None;
+        let mut session: Option<Established> = None;
+
         let mut connected_at: Option<Instant> = None;
         loop {
             tokio::select! {
@@ -119,6 +138,19 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
                         ever_connected = true;
                         tracing::info!(%host_id, "control channel: connected");
                         publish_heartbeat(&client, &heartbeat_topic);
+                        // Open an authenticated session as soon as we connect (#20).
+                        handshaking = begin_handshake(&client, &agent_id, &topics);
+                    }
+                    Ok(Event::Incoming(Packet::Publish(p))) => {
+                        on_publish(
+                            &p.topic,
+                            &p.payload,
+                            &client,
+                            &agent_id,
+                            &topics,
+                            &mut handshaking,
+                            &mut session,
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -166,6 +198,103 @@ pub async fn run(state_dir: &Path, broker_host: &str, broker_port: u16) -> anyho
 fn publish_heartbeat(client: &AsyncClient, topic: &str) {
     if let Err(e) = client.try_publish(topic, QoS::AtMostOnce, false, Vec::new()) {
         tracing::warn!(error = %e, "heartbeat publish skipped");
+    }
+}
+
+/// The per-host session topics (#20), computed once per connection.
+struct SessionTopics {
+    hs_up: String,
+    hs_down: String,
+    ctrl_up: String,
+    ctrl_down: String,
+}
+
+impl SessionTopics {
+    fn for_host(host_id: &str) -> Self {
+        Self {
+            hs_up: osa_core::topics::hs_up(host_id),
+            hs_down: osa_core::topics::hs_down(host_id),
+            ctrl_up: osa_core::topics::ctrl_up(host_id),
+            ctrl_down: osa_core::topics::ctrl_down(host_id),
+        }
+    }
+}
+
+/// Subscribe to the downlinks and publish a fresh `ClientHello` to start an
+/// authenticated session (#20). Subscribes *before* publishing so the
+/// `ServerHello`/beacon cannot be missed. Returns the in-flight state, or `None`
+/// if it could not be started (logged). Non-blocking (`try_*`) so the eventloop
+/// never stalls; a dropped start is retried on the next reconnect.
+fn begin_handshake(
+    client: &AsyncClient,
+    id: &AgentIdentity,
+    topics: &SessionTopics,
+) -> Option<Handshaking> {
+    if let Err(e) = client.try_subscribe(topics.hs_down.clone(), QoS::AtLeastOnce) {
+        tracing::warn!(error = %e, "control channel: subscribing handshake downlink failed");
+        return None;
+    }
+    if let Err(e) = client.try_subscribe(topics.ctrl_down.clone(), QoS::AtLeastOnce) {
+        tracing::warn!(error = %e, "control channel: subscribing control downlink failed");
+        return None;
+    }
+    let (hs, hello) = match crate::session::start_handshake(id) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "control channel: building ClientHello failed");
+            return None;
+        }
+    };
+    if let Err(e) = client.try_publish(topics.hs_up.clone(), QoS::AtLeastOnce, false, hello) {
+        tracing::warn!(error = %e, "control channel: publishing ClientHello failed");
+        return None;
+    }
+    tracing::info!("control channel: session handshake started (#20)");
+    Some(hs)
+}
+
+/// Route an incoming Publish: a `ServerHello` finishes the handshake; the sealed
+/// session-ready beacon is opened and acked, confirming the E2E channel (#20).
+fn on_publish(
+    topic: &str,
+    payload: &[u8],
+    client: &AsyncClient,
+    id: &AgentIdentity,
+    topics: &SessionTopics,
+    handshaking: &mut Option<Handshaking>,
+    session: &mut Option<Established>,
+) {
+    if topic == topics.hs_down {
+        let Some(hs) = handshaking.take() else {
+            tracing::warn!("control channel: ServerHello with no handshake in flight — ignoring");
+            return;
+        };
+        match crate::session::finish_handshake(hs, id, payload) {
+            Ok(est) => {
+                *session = Some(est);
+                tracing::info!("control channel: session established (#20)");
+            }
+            Err(e) => tracing::warn!(error = %e, "control channel: ServerHello rejected"),
+        }
+    } else if topic == topics.ctrl_down {
+        let Some(est) = session.as_ref() else {
+            tracing::warn!("control channel: sealed control before a session — ignoring");
+            return;
+        };
+        match crate::session::confirm_session(est, id, payload) {
+            Ok(ack) => {
+                if let Err(e) =
+                    client.try_publish(topics.ctrl_up.clone(), QoS::AtLeastOnce, false, ack)
+                {
+                    tracing::warn!(error = %e, "control channel: publishing session ack failed");
+                } else {
+                    tracing::info!(
+                        "control channel: session-open confirmed (E2E sealed channel live, #20)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "control channel: session beacon rejected"),
+        }
     }
 }
 
