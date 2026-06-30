@@ -44,6 +44,8 @@ const HOST_CERT_TTL: time::Duration = time::Duration::hours(24);
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(3600);
 /// Default join-token TTL when the operator does not request one.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(900);
+/// Bound on dispatch commands queued from the operator service to the bridge.
+const BRIDGE_COMMAND_QUEUE: usize = 256;
 
 #[derive(Parser)]
 #[command(
@@ -200,13 +202,29 @@ async fn main() -> anyhow::Result<()> {
         &server_cert.key_pem,
     )?;
     std::fs::write(cert_dir.path().join(broker::CA_CERT), ca.ca_root_pem())?;
-    broker::spawn(mqtt_addr, cert_dir.path(), ca.clone(), revocations.clone())?;
+    // The operator service hands dispatches to the bridge over this channel; the
+    // bridge seals them to host sessions and streams results back (Epic 3).
+    let (bridge_tx, bridge_rx) = tokio::sync::mpsc::channel(BRIDGE_COMMAND_QUEUE);
+    broker::spawn(
+        mqtt_addr,
+        cert_dir.path(),
+        ca.clone(),
+        revocations.clone(),
+        bridge_rx,
+    )?;
     wait_until_listening(mqtt_addr).await?;
     tracing::info!(%mqtt_addr, broker_dns = ?cli.broker_dns, "coordinator: embedded MQTT broker (mTLS) + session bridge listening");
 
     let policy = build_policy_engine(&cli)?;
-    let operator =
-        service::OperatorService::new(ca, tokens, revocations, policy, audit, DEFAULT_TOKEN_TTL);
+    let operator = service::OperatorService::new(
+        ca,
+        tokens,
+        revocations,
+        policy,
+        audit,
+        bridge_tx,
+        DEFAULT_TOKEN_TTL,
+    );
 
     let jwt_auth = build_operator_auth(&cli).await?;
 

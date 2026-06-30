@@ -35,6 +35,14 @@ pub fn encode<M: Message>(msg: &M) -> Vec<u8> {
     msg.encode_to_vec()
 }
 
+/// SHA-256 over the opaque capability params, for `ActionDescriptor.params_hash`
+/// (AD-12). Binds the authorized action to the exact params sealed to the agent,
+/// so a policy may constrain on it (the coordinator still never *parses* params).
+pub fn params_hash(params: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(params).to_vec()
+}
+
 /// Decode a protobuf message from an MQTT payload.
 pub fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, prost::DecodeError> {
     M::decode(bytes)

@@ -10,6 +10,7 @@
 //! enforcement spine (Epic 2, AD-18/AD-19). The transport is plaintext for now —
 //! mTLS/TLS wiring is a later channel story.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,15 +21,24 @@ use osa_core::ports::{AuditLog, CertIssuer, PolicyEngine, PortError};
 use osa_proto::v1::enrollment_server::Enrollment;
 use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
-    DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse, ExportAuditRequest,
-    ExportAuditResponse, MintTokenRequest, MintTokenResponse, RenewRequest, RenewResponse,
-    RevokeRequest, RevokeResponse,
+    ActionDescriptor, Dispatch, DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse,
+    ExecEvent, ExportAuditRequest, ExportAuditResponse, JobResult, MintTokenRequest,
+    MintTokenResponse, RenewRequest, RenewResponse, RevokeRequest, RevokeResponse,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+use crate::broker::BridgeCommand;
 use crate::ca::EmbeddedCa;
 use crate::revocation::Revocations;
 use crate::token::{JoinTokens, MintError};
+
+/// Bound on undelivered streamed result events buffered per `Exec` call (absorbs
+/// output bursts a slow operator hasn't drained yet; on sustained overrun the
+/// bridge aborts the job rather than corrupting output silently).
+const EXEC_EVENT_QUEUE: usize = 256;
 
 /// Backs both gRPC services: the agent-facing `Enrollment` (self-authenticating)
 /// and the operator-facing `Operator` (OIDC/JWT-gated). Cloning is cheap — every
@@ -41,6 +51,9 @@ pub struct OperatorService {
     revocations: Arc<dyn Revocations>,
     policy: Arc<dyn PolicyEngine>,
     audit: Arc<dyn AuditLog>,
+    /// Hands dispatches to the broker bridge, which seals them to a host's session
+    /// and streams results back (Epic 3). Cheap to clone (an mpsc sender).
+    bridge: mpsc::Sender<BridgeCommand>,
     default_ttl: Duration,
 }
 
@@ -51,6 +64,7 @@ impl OperatorService {
         revocations: Arc<dyn Revocations>,
         policy: Arc<dyn PolicyEngine>,
         audit: Arc<dyn AuditLog>,
+        bridge: mpsc::Sender<BridgeCommand>,
         default_ttl: Duration,
     ) -> Self {
         Self {
@@ -59,9 +73,65 @@ impl OperatorService {
             revocations,
             policy,
             audit,
+            bridge,
             default_ttl,
         }
     }
+
+    /// The coordinator is the sole PDP (AD-19): authorize `subject` against
+    /// `action`, then record the decision (allow AND deny, AD-21) before acting on
+    /// it. A failed audit write fails closed (an unauditable action must not
+    /// proceed). Returns the decision, or an internal `Status` on a backend error.
+    async fn authorize_and_audit(
+        &self,
+        subject: &str,
+        action: &ActionDescriptor,
+    ) -> Result<Decision, Status> {
+        let decision = match self.policy.authorize(subject, action).await {
+            Ok(()) => Decision::Allow,
+            Err(PortError::Denied) => Decision::Deny,
+            Err(other) => {
+                tracing::error!(error = %other, "authorization failed");
+                return Err(Status::internal("authorization failed"));
+            }
+        };
+        self.audit
+            .append(AuditRecord {
+                ts_unix: now_unix(),
+                subject: subject.to_string(),
+                kind: action.kind.clone(),
+                target: action.target.clone(),
+                run_as: action.run_as.clone(),
+                decision,
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "audit append failed");
+                Status::internal("audit log unavailable")
+            })?;
+        Ok(decision)
+    }
+}
+
+/// The operator (AD-18), bound by the auth interceptor; `anonymous` only when the
+/// API runs without OIDC — and deny-by-default means anonymous has no bindings.
+fn operator_of<T>(request: &Request<T>) -> String {
+    request.extensions().get::<Subject>().map_or_else(
+        || crate::policy::ANONYMOUS_SUBJECT.to_string(),
+        |s| s.0.clone(),
+    )
+}
+
+/// Relay one agent `JobResult` as an operator-facing `ExecEvent` (drop the
+/// job_id — the operator's stream is already scoped to one job).
+fn to_exec_event(result: JobResult) -> ExecEvent {
+    use osa_proto::v1::{exec_event, job_result};
+    let event = match result.body {
+        Some(job_result::Body::Chunk(c)) => Some(exec_event::Event::Chunk(c)),
+        Some(job_result::Body::Outcome(o)) => Some(exec_event::Event::Outcome(o)),
+        None => None,
+    };
+    ExecEvent { event }
 }
 
 /// The current wall-clock as unix seconds, for audit timestamps.
@@ -125,13 +195,7 @@ impl Operator for OperatorService {
         &self,
         request: Request<DispatchRequest>,
     ) -> Result<Response<DispatchResponse>, Status> {
-        // The authenticated operator (AD-18), bound by the auth interceptor.
-        // `anonymous` only when the API runs without OIDC — and deny-by-default
-        // means anonymous has no bindings, so it is denied below.
-        let subject = request.extensions().get::<Subject>().map_or_else(
-            || crate::policy::ANONYMOUS_SUBJECT.to_string(),
-            |s| s.0.clone(),
-        );
+        let subject = operator_of(&request);
         let action = request
             .into_inner()
             .action
@@ -139,39 +203,9 @@ impl Operator for OperatorService {
         if action.kind.is_empty() {
             return Err(Status::invalid_argument("action kind is empty"));
         }
-
-        // The coordinator is the sole PDP (AD-19): authorize before any agent is
-        // contacted. Both outcomes are auditable.
-        let decision = match self.policy.authorize(&subject, &action).await {
-            Ok(()) => Decision::Allow,
-            Err(PortError::Denied) => Decision::Deny,
-            Err(other) => {
-                tracing::error!(error = %other, "authorization failed");
-                return Err(Status::internal("authorization failed"));
-            }
-        };
-
-        // Record the decision (allowed AND denied, AD-21) before acting on it. A
-        // failure to write the audit log fails the dispatch closed — an
-        // unauditable action must not proceed.
-        self.audit
-            .append(AuditRecord {
-                ts_unix: now_unix(),
-                subject: subject.clone(),
-                kind: action.kind.clone(),
-                target: action.target.clone(),
-                run_as: action.run_as.clone(),
-                decision,
-            })
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "audit append failed");
-                Status::internal("audit log unavailable")
-            })?;
-
-        match decision {
+        match self.authorize_and_audit(&subject, &action).await? {
             Decision::Allow => {
-                tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch authorized (execution stubbed until Epic 3)");
+                tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "dispatch authorized (execution stubbed; use Exec to stream)");
                 Ok(Response::new(DispatchResponse {}))
             }
             Decision::Deny => {
@@ -179,6 +213,57 @@ impl Operator for OperatorService {
                 Err(Status::permission_denied("not authorized for this action"))
             }
         }
+    }
+
+    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecEvent, Status>> + Send>>;
+
+    async fn exec(
+        &self,
+        request: Request<DispatchRequest>,
+    ) -> Result<Response<Self::ExecStream>, Status> {
+        let subject = operator_of(&request);
+        let DispatchRequest { action, params } = request.into_inner();
+        let action = action.ok_or_else(|| Status::invalid_argument("missing action"))?;
+        if action.kind.is_empty() {
+            return Err(Status::invalid_argument("action kind is empty"));
+        }
+        // A single host_id target for v1 (host selectors/fan-out are story 3.4). A
+        // malformed target is a client error (InvalidArgument), not an authz
+        // decision, so it is rejected here without an audit record.
+        let host_id = action
+            .target
+            .parse::<uuid::Uuid>()
+            .map(HostId)
+            .map_err(|_| Status::invalid_argument("target is not a host_id"))?;
+
+        // Same authorize-then-audit as Dispatch (allow AND deny), before any agent.
+        if self.authorize_and_audit(&subject, &action).await? == Decision::Deny {
+            tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "exec denied");
+            return Err(Status::permission_denied("not authorized for this action"));
+        }
+
+        // Mint a job id, seal the opaque params to the host's session via the
+        // bridge, and stream the host's results back as they arrive.
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let dispatch = Dispatch {
+            job_id: job_id.clone(),
+            kind: action.kind.clone(),
+            run_as: action.run_as.clone(),
+            params,
+        };
+        let (events_tx, events_rx) = mpsc::channel::<JobResult>(EXEC_EVENT_QUEUE);
+        self.bridge
+            .send(BridgeCommand::Dispatch {
+                host_id,
+                dispatch,
+                events: events_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("dispatch bridge unavailable"))?;
+        tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, %job_id, "exec dispatched");
+
+        let stream = ReceiverStream::new(events_rx).map(|r| Ok(to_exec_event(r)));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn export_audit(
@@ -300,12 +385,17 @@ mod tests {
         let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
         let tokens = Arc::new(JoinTokenRegistry::new(Duration::from_secs(3600)));
         let revocations = Arc::new(RevocationRegistry::new());
+        // The unit tests exercise mint/enroll/dispatch-authz, none of which reach
+        // the bridge (deny + invalid-arg paths return before it), so a closed
+        // command channel is fine.
+        let (bridge_tx, _bridge_rx) = mpsc::channel(8);
         OperatorService::new(
             ca,
             tokens,
             revocations,
             policy,
             audit,
+            bridge_tx,
             Duration::from_secs(900),
         )
     }
@@ -320,6 +410,7 @@ mod tests {
                 run_as: String::new(),
                 params_hash: Vec::new(),
             }),
+            params: Vec::new(),
         });
         if let Some(s) = subject {
             req.extensions_mut().insert(Subject(s.to_string()));
@@ -473,6 +564,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_is_denied_by_default_before_any_dispatch() {
+        // The streaming Exec shares authorize-then-audit: deny-all rejects it
+        // PERMISSION_DENIED before reaching the bridge.
+        let svc = service();
+        let err = svc
+            .exec(dispatch_req(Some("alice@example"), "exec", HOST))
+            .await
+            .err()
+            .expect("a denied exec must not open a stream");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn exec_with_a_non_uuid_target_is_invalid() {
+        let policy = Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["exec"]
+                selectors = ["*"]
+            "#,
+            )
+            .unwrap(),
+        );
+        let svc = service_with_policy(policy);
+        let err = svc
+            .exec(dispatch_req(Some("alice@example"), "exec", "not-a-host-id"))
+            .await
+            .err()
+            .expect("a non-UUID target must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn dispatch_is_allowed_by_a_matching_binding() {
         let policy = Arc::new(
             crate::policy::RbacPolicyEngine::from_toml(
@@ -524,7 +650,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_without_an_action_is_invalid() {
         let svc = service();
-        let mut req = Request::new(DispatchRequest { action: None });
+        let mut req = Request::new(DispatchRequest {
+            action: None,
+            params: Vec::new(),
+        });
         req.extensions_mut().insert(Subject("alice@example".into()));
         let err = svc.dispatch(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -665,6 +794,7 @@ mod tests {
                 .unwrap(),
         );
         let replica = |pool: sqlx::PgPool| {
+            let (bridge_tx, _bridge_rx) = mpsc::channel(8);
             OperatorService::new(
                 ca.clone(),
                 Arc::new(crate::token::PgJoinTokens::new(
@@ -674,6 +804,7 @@ mod tests {
                 Arc::new(crate::revocation::PgRevocations::new(pool.clone())),
                 Arc::new(crate::policy::RbacPolicyEngine::empty()),
                 Arc::new(crate::audit_log::PgAuditLog::new(pool)),
+                bridge_tx,
                 Duration::from_secs(900),
             )
         };
