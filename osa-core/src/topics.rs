@@ -34,6 +34,10 @@ pub const CTRL_UP_FILTER: &str = "/tenants/+/osa/v1/up/ctrl";
 /// Filter matching every host's sealed job-result uplink (Epic 3).
 pub const RESULT_UP_FILTER: &str = "/tenants/+/osa/v1/up/result";
 
+/// Filter matching every host's sealed stream uplink (Epic 4 — interactive shell /
+/// port-forward bytes).
+pub const STREAM_UP_FILTER: &str = "/tenants/+/osa/v1/up/stream";
+
 /// The broker tenant id for a host: its `host_id` with hyphens stripped, so it is
 /// alphanumeric as `validate-tenant-prefix` requires. Must equal the cert's O.
 pub fn tenant(host_id: &str) -> String {
@@ -86,6 +90,19 @@ pub fn result_up(host_id: &str) -> String {
     format!("{}{ROOT}/up/result", tenant_prefix(host_id))
 }
 
+/// The sealed stream downlink: the coordinator publishes sealed `KIND_STREAM`
+/// frames (operator→host bytes) here, and the agent subscribes to it (Epic 4).
+pub fn stream_down(host_id: &str) -> String {
+    format!("{}{ROOT}/down/stream", tenant_prefix(host_id))
+}
+
+/// The sealed stream uplink: the agent publishes sealed `KIND_STREAM` frames
+/// (host→operator bytes) here, and the coordinator subscribes across all tenants
+/// via [`STREAM_UP_FILTER`] (Epic 4).
+pub fn stream_up(host_id: &str) -> String {
+    format!("{}{ROOT}/up/stream", tenant_prefix(host_id))
+}
+
 /// Extract the tenant id (hyphen-stripped host_id) from a topic whose tail after
 /// the tenant segment equals `tail`. The broker confines each client to its own
 /// `/tenants/<O>/…` subtree, so a topic matching the scheme names the tenant that
@@ -114,6 +131,11 @@ pub fn tenant_from_ctrl_up(topic: &str) -> Option<&str> {
 /// Extract the tenant id from a sealed job-result uplink topic (Epic 3).
 pub fn tenant_from_result_up(topic: &str) -> Option<&str> {
     tenant_for_tail(topic, "osa/v1/up/result")
+}
+
+/// Extract the tenant id from a sealed stream uplink topic (Epic 4).
+pub fn tenant_from_stream_up(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/stream")
 }
 
 #[cfg(test)]
@@ -181,13 +203,20 @@ mod tests {
             format!("/tenants/{t}/osa/v1/down/dispatch")
         );
         assert_eq!(result_up(host), format!("/tenants/{t}/osa/v1/up/result"));
+        assert_eq!(
+            stream_down(host),
+            format!("/tenants/{t}/osa/v1/down/stream")
+        );
+        assert_eq!(stream_up(host), format!("/tenants/{t}/osa/v1/up/stream"));
         assert_eq!(tenant_from_hs_up(&hs_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_ctrl_up(&ctrl_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_result_up(&result_up(host)), Some(t.as_str()));
+        assert_eq!(tenant_from_stream_up(&stream_up(host)), Some(t.as_str()));
         // The filters match the produced shapes.
         assert_eq!(HS_UP_FILTER, "/tenants/+/osa/v1/up/hs");
         assert_eq!(CTRL_UP_FILTER, "/tenants/+/osa/v1/up/ctrl");
         assert_eq!(RESULT_UP_FILTER, "/tenants/+/osa/v1/up/result");
+        assert_eq!(STREAM_UP_FILTER, "/tenants/+/osa/v1/up/stream");
     }
 
     #[test]
@@ -197,5 +226,8 @@ mod tests {
         assert_eq!(tenant_from_hs_up(&heartbeat(host)), None);
         assert_eq!(tenant_from_hs_up(&hs_down(host)), None);
         assert_eq!(tenant_from_ctrl_up(&hs_up(host)), None);
+        // The stream uplink extractor must not match the downlink or other channels.
+        assert_eq!(tenant_from_stream_up(&stream_down(host)), None);
+        assert_eq!(tenant_from_stream_up(&result_up(host)), None);
     }
 }

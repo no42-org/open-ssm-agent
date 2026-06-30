@@ -42,6 +42,9 @@ pub enum Direction {
 
 const LABEL_C2A: &[u8] = b"osa/v1 c2a";
 const LABEL_A2C: &[u8] = b"osa/v1 a2c";
+/// Info prefix for a per-stream subkey derived from a session direction key
+/// (Epic 4). The `stream_id` bytes follow, binding the subkey to one stream.
+const LABEL_STREAM: &[u8] = b"osa/v1 stream ";
 
 /// AEAD open failed: the ciphertext, AAD, nonce, direction, or key did not match.
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +134,45 @@ impl SessionKeys {
         keys
     }
 
+    /// Derive an **independent** per-stream key set from this session's keys
+    /// (Epic 4, interactive shell / port-forward streams).
+    ///
+    /// Each direction key is run through HKDF-Expand (the session key is already a
+    /// uniform PRK) with an info string binding `stream_id`, yielding fresh `c2a`
+    /// and `a2c` keys for the stream. Because the stream's keys differ from the
+    /// session's, the stream owns a **separate `(key, seq)` nonce space starting at
+    /// 0**: its frames can never collide with control/dispatch nonces, so a stream
+    /// needs no shared sequence with the control channel and a delayed control
+    /// frame cannot head-of-line-block it. Distinct `stream_id`s derive distinct
+    /// keys; equal ids on both peers derive equal keys (the coordinator mints the
+    /// id over the authenticated channel).
+    ///
+    /// # Caller contract (load-bearing)
+    /// Two obligations, both on the caller:
+    /// - The per-direction, strictly-monotonic-`seq` rule of [`seal`] applies to
+    ///   the returned keys (a stream's `seq` runs from 0, independent of control).
+    /// - **`stream_id` MUST be unique per session.** Reusing one (a counter reset,
+    ///   a resumed/reconnected stream that recycles its id, or two concurrent
+    ///   streams sharing an id) re-derives the **same** key and restarts `seq` at
+    ///   0 — catastrophic AES-GCM nonce reuse (plaintext-XOR leak **and** tag
+    ///   forgery), the same hazard [`seal`] warns about. The coordinator mints a
+    ///   fresh `stream_id` per stream over the authenticated channel and never
+    ///   recycles one within a session.
+    ///
+    /// [`seal`]: SessionKeys::seal
+    pub fn derive_stream(&self, stream_id: &[u8]) -> SessionKeys {
+        let mut c2a = [0u8; 32];
+        let mut a2c = [0u8; 32];
+        expand_stream(&self.c2a, stream_id, &mut c2a);
+        expand_stream(&self.a2c, stream_id, &mut a2c);
+        let keys = SessionKeys { c2a, a2c };
+        // Wipe the stack copies (the keys live on in `keys`, zeroized on drop),
+        // matching `from_shared`'s hygiene.
+        c2a.zeroize();
+        a2c.zeroize();
+        keys
+    }
+
     fn cipher(&self, dir: Direction) -> Aes256Gcm {
         let key = match dir {
             Direction::CoordToAgent => &self.c2a,
@@ -187,6 +229,19 @@ impl SessionKeys {
             )
             .map_err(|_| OpenError)
     }
+}
+
+/// HKDF-Expand a session direction key (a uniform PRK) into a per-stream subkey,
+/// binding `stream_id` in the info so distinct streams get distinct keys. Writes
+/// into `out` (rather than returning by value) so no secret copy is left on this
+/// frame; the caller owns wiping `out`.
+fn expand_stream(dir_key: &[u8; 32], stream_id: &[u8], out: &mut [u8; 32]) {
+    let hk = Hkdf::<Sha256>::from_prk(dir_key).expect("a 32-byte session key is a valid PRK");
+    let mut info = Vec::with_capacity(LABEL_STREAM.len() + stream_id.len());
+    info.extend_from_slice(LABEL_STREAM);
+    info.extend_from_slice(stream_id);
+    hk.expand(&info, out)
+        .expect("32 is a valid HKDF-SHA256 output length");
 }
 
 /// 96-bit GCM nonce: four zero bytes followed by `seq` big-endian.
@@ -270,6 +325,49 @@ mod tests {
         let kb = b.derive(&apub, b"binding-2").unwrap(); // different binding
         let ct = ka.seal(Direction::CoordToAgent, 0, b"", b"x");
         assert!(kb.open(Direction::CoordToAgent, 0, b"", &ct).is_err());
+    }
+
+    #[test]
+    fn a_stream_subkey_round_trips_across_the_pair() {
+        // Both peers derive the same stream from their session keys and the same
+        // stream_id, and seal/open round-trips — independently of the session's
+        // own seq space (here both the session and the stream use seq 0).
+        let (ka, kb) = session_pair();
+        let sa = ka.derive_stream(b"stream-1");
+        let sb = kb.derive_stream(b"stream-1");
+        let ct = sa.seal(Direction::CoordToAgent, 0, b"hdr", b"keystroke");
+        assert_eq!(
+            sb.open(Direction::CoordToAgent, 0, b"hdr", &ct).unwrap(),
+            b"keystroke"
+        );
+    }
+
+    #[test]
+    fn distinct_stream_ids_derive_distinct_keys() {
+        let (ka, kb) = session_pair();
+        let sa = ka.derive_stream(b"stream-1");
+        let sb = kb.derive_stream(b"stream-2"); // different stream
+        let ct = sa.seal(Direction::AgentToCoord, 0, b"hdr", b"x");
+        assert!(
+            sb.open(Direction::AgentToCoord, 0, b"hdr", &ct).is_err(),
+            "a different stream_id must derive a non-matching key"
+        );
+    }
+
+    #[test]
+    fn a_stream_subkey_is_independent_of_the_session_key() {
+        // The whole point of the per-stream subkey: the stream's (key, seq) space
+        // is disjoint from the session's, so reusing seq 0 across them never
+        // collides into a usable (key, nonce). A frame sealed with the SESSION key
+        // does not open with the STREAM key at the same seq, and vice-versa.
+        let (ka, kb) = session_pair();
+        let sb = kb.derive_stream(b"stream-1");
+        let ct_session = ka.seal(Direction::CoordToAgent, 0, b"hdr", b"x");
+        assert!(
+            sb.open(Direction::CoordToAgent, 0, b"hdr", &ct_session)
+                .is_err(),
+            "the session key and the stream subkey must be independent"
+        );
     }
 
     #[test]
