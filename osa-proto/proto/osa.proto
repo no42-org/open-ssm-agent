@@ -59,6 +59,57 @@ message ActionDescriptor {
   bytes params_hash = 4; // canonical hash of the opaque params
 }
 
+// Coordinator → agent, **sealed** on `…/down/dispatch` (#20, Epic 3). The
+// coordinator authorizes/audits on the ActionDescriptor and seals the OPAQUE
+// `params` here without parsing them (capability-agnostic, AD-12). The agent
+// selects the capability by `kind`. Within a session, a replayed dispatch is
+// rejected by the envelope's monotonic seq; `job_id`-keyed idempotency across
+// reconnects (AD-22) is deferred to story 3.3.
+message Dispatch {
+  string job_id = 1;   // idempotency / result-correlation key (AD-22; dedup in 3.3)
+  string kind = 2;     // capability selector, e.g. "exec"
+  string run_as = 3;   // the authorized target unix user (AD-19/AD-20)
+  bytes params = 4;    // opaque capability params (ExecParams for exec)
+}
+
+// The exec capability's params — the agent decodes these; the coordinator never
+// does. `argv[0]` is the program, the rest its arguments (no shell).
+message ExecParams {
+  repeated string argv = 1;
+}
+
+// Agent → coordinator, **sealed** on `…/up/result` (#20, Epic 3). A job streams
+// many `OutputChunk`s in order followed by exactly one terminal `JobOutcome`.
+message JobResult {
+  string job_id = 1;
+  oneof body {
+    OutputChunk chunk = 2;
+    JobOutcome outcome = 3;
+  }
+}
+
+// One ordered slice of a job's output.
+message OutputChunk {
+  enum Stream {
+    STREAM_UNSPECIFIED = 0;
+    STDOUT = 1;
+    STDERR = 2;
+  }
+  Stream stream = 1;
+  bytes data = 2;
+}
+
+// A job's terminal status: exactly one of exited / signaled / failed.
+message JobOutcome {
+  oneof terminal {
+    int32 exit_code = 1; // normal exit
+    int32 signal = 2;    // killed by a signal
+    string error = 3;    // the job could not run (typed capability error, rendered)
+  }
+  bool output_truncated = 4; // the output byte-cap was hit
+  bool timed_out = 5;        // the execution deadline was hit
+}
+
 // Agent-facing enrollment surface (AD-25). These RPCs carry their **own**
 // authentication — a single-use join token (Enroll) or the current cert + a CSR
 // proving key possession (Renew) — so they are NOT behind the operator OIDC/JWT
