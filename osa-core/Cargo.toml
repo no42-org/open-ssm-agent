@@ -18,6 +18,9 @@ aes-gcm = "0.10.3"
 hkdf = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+# ECDSA P-256 (the identity-key algorithm) to authenticate the session handshake
+# ephemerals against a broker MITM (AD-27, #20).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 getrandom = "0.4.3"
 # Operator JWT validation (AD-18). RS*/ES* + JWKS parsing; pure, no network here.
