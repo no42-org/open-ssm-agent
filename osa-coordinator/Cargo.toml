@@ -51,8 +51,12 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 sha2 = "0.10"
 
 [dev-dependencies]
-# Mint operator JWTs in the interceptor test (same crate osa-core validates with).
+# Mint operator JWTs in the interceptor + auth-boundary tests (same crate osa-core
+# validates with).
 jsonwebtoken = "9.3"
+# `TcpListenerStream` — serve the gRPC router on an ephemeral port in the
+# auth-boundary test (#33). `net` is additive over the normal-dep features.
+tokio-stream = { version = "0.1.17", features = ["net"] }
 serde.workspace = true
 # Ephemeral Postgres for the durable-store integration tests (AD-24).
 testcontainers-modules = { version = "0.11", features = ["postgres"] }

@@ -228,39 +228,46 @@ async fn main() -> anyhow::Result<()> {
 
     let jwt_auth = build_operator_auth(&cli).await?;
 
-    // The Enrollment service (Enroll/Renew) is agent-facing and self-authenticating
-    // (join token / cert proof-of-possession) — it is NEVER behind the operator
-    // OIDC/JWT gate. Only the operator-facing Operator service is interceptor-gated.
-    let enrollment = EnrollmentServer::new(operator.clone());
+    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator + Enrollment gRPC (plaintext)");
+    if jwt_auth.is_some() {
+        tracing::info!("operator authentication: OIDC/JWT required (AD-18)");
+    } else {
+        tracing::warn!(
+            "operator API is UNAUTHENTICATED — set --oidc-issuer/--oidc-audience/--oidc-jwks to require operator JWTs"
+        );
+    }
+    build_router(operator, jwt_auth).serve(addr).await?;
+    Ok(())
+}
 
+/// Assemble the gRPC router: the operator-facing `Operator` service behind the
+/// optional operator JWT interceptor (AD-18), and the agent-facing `Enrollment`
+/// service (Enroll/Renew), which is **never** interceptor-gated — it carries its
+/// own authentication (single-use join token / cert proof-of-possession, AD-25).
+///
+/// Extracted from `main` so the auth boundary is exercised by a wire-level test
+/// (see `tests` below) rather than only assembled inline. A regression that
+/// re-wrapped Enrollment in the operator gate — the exact shape of #31 — would
+/// break agent enroll/renew while every in-process handler unit test still
+/// passed, because those bypass the gRPC server + interceptor entirely.
+fn build_router(
+    operator: service::OperatorService,
+    jwt_auth: Option<auth::JwtAuth>,
+) -> tonic::transport::server::Router {
+    let enrollment = EnrollmentServer::new(operator.clone());
     // Bound per-request time and per-connection concurrency to blunt abuse of the
     // enrollment surface.
     let mut server = tonic::transport::Server::builder()
         .timeout(Duration::from_secs(30))
         .concurrency_limit_per_connection(64);
-
-    tracing::info!(config = %cli.config, %addr, "coordinator: serving Operator + Enrollment gRPC (plaintext)");
     match jwt_auth {
-        Some(jwt_auth) => {
-            tracing::info!("operator authentication: OIDC/JWT required (AD-18)");
-            server
-                .add_service(OperatorServer::with_interceptor(operator, jwt_auth))
-                .add_service(enrollment)
-                .serve(addr)
-                .await?;
-        }
-        None => {
-            tracing::warn!(
-                "operator API is UNAUTHENTICATED — set --oidc-issuer/--oidc-audience/--oidc-jwks to require operator JWTs"
-            );
-            server
-                .add_service(OperatorServer::new(operator))
-                .add_service(enrollment)
-                .serve(addr)
-                .await?;
-        }
+        Some(jwt_auth) => server
+            .add_service(OperatorServer::with_interceptor(operator, jwt_auth))
+            .add_service(enrollment),
+        None => server
+            .add_service(OperatorServer::new(operator))
+            .add_service(enrollment),
     }
-    Ok(())
 }
 
 /// Build the deny-by-default RBAC PDP (AD-19) from the policy file, or an
@@ -395,4 +402,258 @@ async fn wait_until_listening(addr: SocketAddr) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("embedded broker did not start listening on {addr}")
+}
+
+/// The operator/enrollment **auth boundary**, exercised over a real gRPC
+/// connection through `build_router` (#33). This is the gap that hid #31: the
+/// operator JWT interceptor once wrapped the whole service, breaking agent
+/// enroll/renew — yet every handler unit test passed, because they call handlers
+/// in-process and never traverse the server + interceptor. These tests connect a
+/// real client to a real server and assert the boundary at the wire:
+///
+/// - operator RPCs (e.g. `MintToken`) REQUIRE a valid operator JWT, and
+/// - the agent `Enrollment` surface is reachable WITHOUT one (it runs its own
+///   token / proof-of-possession auth instead).
+#[cfg(test)]
+mod auth_boundary_tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use osa_core::auth::{JwtValidator, ValidationPolicy};
+    use osa_proto::v1::enrollment_client::EnrollmentClient;
+    use osa_proto::v1::operator_client::OperatorClient;
+    use osa_proto::v1::{EnrollRequest, MintTokenRequest};
+    use serde::Serialize;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Channel, Endpoint};
+
+    const ISSUER: &str = "https://issuer.example/";
+    const AUDIENCE: &str = "osa-coordinator";
+
+    // Hermetic RS256 test material (same throwaway key the osa-core/auth tests
+    // use): the private PEM mints tokens here; the validator parses the matching
+    // public JWKS. Generated offline; never used outside tests.
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCfE4eSObMn1QZq
+7aeBKXKo3K0mvMS+iZo9aQMbX7MrpQLfeMOxUiXPcdsIxputElzjQCazgkv3MxWF
+e61qx6EGOuk+4CL46RG4Wq+SppaUoLCGlOdY3aFhX5t7d/ZsL1e4q/8lOSKLPTM6
+0oQ4oTKvMhBuRjED7DLq6V4MmISoNNBF8ZPWuXgnMEqDwJmbrmMPPpP3F/SK0QcW
+8LFBAMQfOO1pKQzcj1ayujE8afRwo7u1N64BM7ojf1XhzTwfn0SX0CiwOf4dcGBo
+rcoHZe8GQxNKScz/1R42bHP7ItjbvvraFEyz9U/AQp2Vp6sdBakT5LQXk4IUH3J1
+wEtLynatAgMBAAECggEAJP213CE6QbQ1/JX8ilrAzLcaNaSWTKdzXD3n6MzpfWfv
+AdfTi8+qNrHHaSREDaw0OO0RQtN1BkwVAFgI9Mhsr6Xx2LrmrwKFqhy+cKf34qJ2
+QilsnbvV++5vWbgE79XXfHxUhcuiNoY5/D75W7DSeC54Zyg/3CVoFrvDMMMjr/hQ
+JzJsdmAJ7dG9358eQXdoTJiMrhNmxuIQHy9DqOcEVpsBp1uKrvEaRDb6phj5HHIz
+TtoOPRTFC79dkZ9fyeYV/Ku5qPVT3wJrv+pWUylSaBGwrmP7rsgVumauqCR8Yx/p
+dwSGsMYSKj4RDPJqdprVj8LP0u4b+KWDo+lsmp8qOQKBgQDO7DpCeDz7mOZbDAJz
+4VlvaQt7YT3++wQ3eJSjBu2DzOdVdbaV4j6TIRS4zz45YV/WgvlP3cYCnXvdSX3P
+6sPx+g0Eb9F7bwfyXNMSX1fyF1SagHuZ2NMDNu8xnh1HGVFpc/gIDvkKrVZojaXf
+gtdUCOlmi3orGn6sBAz0ycjvRQKBgQDEzjKSYJClzDd0RbBEB8TJDIpzR+KwN+B7
+SZ+D9VE6cKz2f2GMXckH+4m2tnncFhFD+ZK0pY41+LI5v72f2Q6K0qXT0rMWvj5j
+WT8NlmoB3YxJVyryDQEdPJGnyy+dXXuUkQaVGCQUDTQF2FA4F8rxaDjYhvBZgvQP
+Vj0XUhsMSQKBgQC4AoqsoZBZjVcMkFl+A2AtGxUC2y7umPre+XP0piyBkK4H6W49
+S7ypyjlLP8Dt9hHsCPz8cROtL67+0mP3iaZGgT8iOu3m/o3qkXGCXRcwSl8KJkfE
+QHUl3qxHS3xtxa4IQQDI6ce+HvdAcvaXFRu3t1UXw+EYg68x+UgsR2VQoQKBgAM2
+kqDNLs9mLCmb0arqrY3SxJfpPow9/U5F/3K6GJ9po4lKvx75kQSuWKtBA3BSc+m2
+M2z7nvzGmLJUrRXlB1XA5rA0qnPem0on9N2V7RkmstmnsK3PBIujp4Ujzh01n4Tn
+cUIR6NTi+kx2IakoyklyuCrg2R+9AZsWf1zYHFTxAoGAR3I7LujdzIRNXPtZEmyl
+hdSa21dZ/yguvJEGuXkEEA6uDbWZ8NJBQWgSO7er6526z+nEPMT3CxLHwan6bqAO
+lC0IHFk6GDyzSxlPRKbLMCRIO+rU8vfX7PwolHxYzVqxX3MlrOD3sJdURsVp+Qh9
+ycpRumeHZKJHtUrce7hTefI=
+-----END PRIVATE KEY-----";
+
+    const TEST_JWKS: &str = r#"{"keys":[{"kty":"RSA","kid":"test-key-1","use":"sig","alg":"RS256","n":"nxOHkjmzJ9UGau2ngSlyqNytJrzEvomaPWkDG1-zK6UC33jDsVIlz3HbCMabrRJc40Ams4JL9zMVhXutasehBjrpPuAi-OkRuFqvkqaWlKCwhpTnWN2hYV-be3f2bC9XuKv_JTkiiz0zOtKEOKEyrzIQbkYxA-wy6uleDJiEqDTQRfGT1rl4JzBKg8CZm65jDz6T9xf0itEHFvCxQQDEHzjtaSkM3I9WsroxPGn0cKO7tTeuATO6I39V4c08H59El9AosDn-HXBgaK3KB2XvBkMTSknM_9UeNmxz-yLY27762hRMs_VPwEKdlaerHQWpE-S0F5OCFB9ydcBLS8p2rQ","e":"AQAB"}]}"#;
+
+    #[derive(Serialize)]
+    struct Claims {
+        sub: String,
+        iss: String,
+        aud: String,
+        exp: i64,
+    }
+
+    /// A valid operator JWT signed by the test key.
+    fn valid_token() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = Claims {
+            sub: "alice@example".into(),
+            iss: ISSUER.into(),
+            aud: AUDIENCE.into(),
+            exp: now + 3600,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".into());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Wrap a message with the operator `authorization: Bearer <token>` metadata.
+    fn authed<T>(msg: T, token: &str) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(msg);
+        req.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        req
+    }
+
+    fn jwt_auth() -> auth::JwtAuth {
+        let policy = ValidationPolicy {
+            issuer: ISSUER.into(),
+            audience: AUDIENCE.into(),
+            leeway_secs: 60,
+        };
+        let v = JwtValidator::from_jwks_json(policy, TEST_JWKS.as_bytes()).unwrap();
+        auth::JwtAuth::new(Arc::new(v))
+    }
+
+    fn operator_service() -> service::OperatorService {
+        let ca = Arc::new(ca::EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let tokens = Arc::new(token::JoinTokenRegistry::new(StdDuration::from_secs(3600)));
+        let revocations = Arc::new(revocation::RevocationRegistry::new());
+        let policy = Arc::new(policy::RbacPolicyEngine::empty());
+        let audit = Arc::new(audit_log::MemoryAuditLog::new());
+        // No dispatch is issued in these tests, so a closed bridge channel is fine.
+        let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(8);
+        service::OperatorService::new(
+            ca,
+            tokens,
+            revocations,
+            policy,
+            audit,
+            bridge_tx,
+            StdDuration::from_secs(900),
+        )
+    }
+
+    fn csr() -> Vec<u8> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        rcgen::CertificateParams::default()
+            .serialize_request(&key)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    /// Serve the real router (OIDC required) on an ephemeral port; return its URL.
+    /// The listener is bound (and thus accepting) before we return, so a client
+    /// can connect immediately without racing the spawned server task.
+    async fn serve() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = build_router(operator_service(), Some(jwt_auth()));
+        tokio::spawn(async move {
+            router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn channel(url: &str) -> Channel {
+        Endpoint::from_shared(url.to_string())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn operator_rpc_without_a_token_is_unauthenticated() {
+        let url = serve().await;
+        let mut client = OperatorClient::new(channel(&url).await);
+        let err = client
+            .mint_token(MintTokenRequest { ttl_seconds: 0 })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn operator_rpc_with_a_bad_token_is_unauthenticated() {
+        let url = serve().await;
+        let mut client = OperatorClient::new(channel(&url).await);
+        let err = client
+            .mint_token(authed(MintTokenRequest { ttl_seconds: 0 }, "not.a.jwt"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn operator_rpc_with_a_valid_token_succeeds() {
+        let url = serve().await;
+        let mut client = OperatorClient::new(channel(&url).await);
+        let resp = client
+            .mint_token(authed(MintTokenRequest { ttl_seconds: 0 }, &valid_token()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.join_token.is_empty());
+    }
+
+    /// The #31 regression guard: with OIDC required on the operator surface, an
+    /// agent still enrolls with NO operator token. An operator mints a join token
+    /// (authenticated); the agent redeems it over the ungated Enrollment service
+    /// and gets a real identity back. Under the #31 bug this `enroll` would return
+    /// `Unauthenticated` and the unwrap would panic.
+    #[tokio::test]
+    async fn enrollment_is_reachable_without_an_operator_token() {
+        let url = serve().await;
+
+        let mut operator = OperatorClient::new(channel(&url).await);
+        let join_token = operator
+            .mint_token(authed(MintTokenRequest { ttl_seconds: 0 }, &valid_token()))
+            .await
+            .unwrap()
+            .into_inner()
+            .join_token;
+
+        let mut agent = EnrollmentClient::new(channel(&url).await);
+        let resp = agent
+            .enroll(EnrollRequest {
+                join_token,
+                csr: csr(),
+            })
+            .await
+            .expect("enroll must NOT be behind the operator JWT gate (#31)")
+            .into_inner();
+        assert_eq!(
+            uuid::Uuid::parse_str(&resp.host_id)
+                .unwrap()
+                .get_version_num(),
+            4,
+            "a successful enroll returns a UUIDv4 host_id"
+        );
+    }
+
+    /// Enrollment runs its OWN auth, not the operator gate: a bogus join token is
+    /// `PermissionDenied` by the handler — proof the request reached it — rather
+    /// than `Unauthenticated` from an interceptor that never should have run.
+    #[tokio::test]
+    async fn enrollment_runs_its_own_auth_not_the_operator_gate() {
+        let url = serve().await;
+        let mut agent = EnrollmentClient::new(channel(&url).await);
+        let err = agent
+            .enroll(EnrollRequest {
+                join_token: "nope".into(),
+                csr: csr(),
+            })
+            .await
+            .unwrap_err();
+        // PermissionDenied — the Enrollment handler's OWN token check ran and
+        // denied — NOT Unauthenticated, which would mean the operator interceptor
+        // (which must never gate Enrollment) ran instead (#31).
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 }
