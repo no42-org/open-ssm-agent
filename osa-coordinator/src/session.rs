@@ -124,6 +124,12 @@ impl SessionStore {
         self.by_host.get_mut(host)
     }
 
+    /// Every host with a live session — the resolution of the `*` selector (the
+    /// hosts the coordinator can actually reach right now) for fan-out (3.4).
+    pub fn host_ids(&self) -> Vec<HostId> {
+        self.by_host.keys().copied().collect()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.by_host.len()

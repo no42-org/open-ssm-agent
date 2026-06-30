@@ -43,25 +43,34 @@ use crate::ca::EmbeddedCa;
 use crate::revocation::Revocations;
 use crate::session::SessionStore;
 
+/// A result destined for an operator's stream, tagged with the host it came from
+/// (so a fan-out across a selector can interleave per-host results, 3.4).
+pub type HostResult = (HostId, JobResult);
+
 /// A command to the bridge from the operator-facing gRPC service. The service
-/// never touches the broker or session keys directly — it asks the bridge to seal
-/// a dispatch to a host and stream the host's results back.
+/// never touches the broker or session keys directly.
 pub enum BridgeCommand {
     /// Seal `dispatch` to `host_id`'s live session and stream its `JobResult`s
-    /// (output chunks, then one terminal outcome) back over `events`. The bridge
-    /// reports a terminal error outcome if the host has no live session.
+    /// (output chunks, then one terminal outcome) back over `events`, tagged with
+    /// `host_id`. The bridge reports a terminal error outcome if the host has no
+    /// live session. Many `Dispatch`es may share one `events` channel (fan-out).
     Dispatch {
         host_id: HostId,
         dispatch: Dispatch,
-        events: mpsc::Sender<JobResult>,
+        events: mpsc::Sender<HostResult>,
+    },
+    /// Reply with the hosts that currently have a live session — the resolution of
+    /// the `*` selector for fan-out (3.4).
+    OnlineHosts {
+        reply: tokio::sync::oneshot::Sender<Vec<HostId>>,
     },
 }
 
-/// One in-flight dispatched job: the operator's result-stream sender plus a
-/// deadline after which it is reaped (so an agent that dies mid-job, or a job that
-/// never sends a terminal outcome, cannot leak the entry forever).
+/// One in-flight dispatched job: the operator's (tagged) result-stream sender plus
+/// a deadline after which it is reaped (so an agent that dies mid-job, or a job
+/// that never sends a terminal outcome, cannot leak the entry forever).
 struct PendingJob {
-    events: mpsc::Sender<JobResult>,
+    events: mpsc::Sender<HostResult>,
     deadline: Instant,
 }
 
@@ -451,31 +460,40 @@ fn handle_command(
     pending: &mut PendingJobs,
     link_tx: &mut LinkTx,
 ) {
-    let BridgeCommand::Dispatch {
-        host_id,
-        dispatch,
-        events,
-    } = cmd;
+    let (host_id, dispatch, events) = match cmd {
+        BridgeCommand::Dispatch {
+            host_id,
+            dispatch,
+            events,
+        } => (host_id, dispatch, events),
+        BridgeCommand::OnlineHosts { reply } => {
+            let _ = reply.send(sessions.host_ids());
+            return;
+        }
+    };
     let job_id = dispatch.job_id.clone();
     let key = (host_id, job_id.clone());
     // A job_id collision would orphan the first operator's stream; refuse it.
     if pending.contains_key(&key) {
-        let _ = events.try_send(error_result(&job_id, "duplicate job_id"));
+        let _ = events.try_send((host_id, error_result(&job_id, "duplicate job_id")));
         return;
     }
     if pending.len() >= MAX_PENDING_JOBS {
-        let _ = events.try_send(error_result(&job_id, "coordinator at job capacity"));
+        let _ = events.try_send((
+            host_id,
+            error_result(&job_id, "coordinator at job capacity"),
+        ));
         return;
     }
     let host_str = host_id.0.to_string();
     let Some(session) = sessions.get_mut(&host_id) else {
-        let _ = events.try_send(error_result(&job_id, "host is not connected"));
+        let _ = events.try_send((host_id, error_result(&job_id, "host is not connected")));
         return;
     };
     let sealed = session.seal_downlink(&host_str, &osa_core::wire::encode(&dispatch));
     if let Err(e) = link_tx.publish(osa_core::topics::dispatch_down(&host_str), sealed) {
         tracing::warn!(error = %e, host = %host_str, %job_id, "publishing dispatch failed");
-        let _ = events.try_send(error_result(&job_id, "failed to reach the host"));
+        let _ = events.try_send((host_id, error_result(&job_id, "failed to reach the host")));
         return;
     }
     pending.insert(
@@ -527,7 +545,7 @@ fn handle_result(
         return;
     };
     let terminal = matches!(result.body, Some(Body::Outcome(_)));
-    match job.events.try_send(result) {
+    match job.events.try_send((host_id, result)) {
         Ok(()) => {
             if terminal {
                 pending.remove(&key); // closes the operator stream
@@ -551,9 +569,10 @@ fn handle_result(
 fn purge_host_jobs(pending: &mut PendingJobs, host: HostId) {
     pending.retain(|(h, job_id), job| {
         if *h == host {
-            let _ = job
-                .events
-                .try_send(error_result(job_id, "host reconnected; job interrupted"));
+            let _ = job.events.try_send((
+                host,
+                error_result(job_id, "host reconnected; job interrupted"),
+            ));
             false
         } else {
             true
@@ -565,11 +584,12 @@ fn purge_host_jobs(pending: &mut PendingJobs, host: HostId) {
 /// terminal outcome), failing each so the operator is not left hanging.
 fn reap_stale_jobs(pending: &mut PendingJobs) {
     let now = Instant::now();
-    pending.retain(|(_, job_id), job| {
+    pending.retain(|(host, job_id), job| {
         if now >= job.deadline {
-            let _ = job
-                .events
-                .try_send(error_result(job_id, "no result from host (timed out)"));
+            let _ = job.events.try_send((
+                *host,
+                error_result(job_id, "no result from host (timed out)"),
+            ));
             false
         } else {
             true
@@ -1214,10 +1234,13 @@ mod tests {
         handle_result(&tenant, &outcome, &mut sessions, &mut pending);
         assert!(pending.is_empty(), "job forgotten on the terminal outcome");
 
-        // The operator received the chunk then the outcome, in order.
-        let r1 = events_rx.try_recv().unwrap();
+        // The operator received the chunk then the outcome, in order, each tagged
+        // with the source host.
+        let (h1, r1) = events_rx.try_recv().unwrap();
+        assert_eq!(h1, host);
         assert!(matches!(r1.body, Some(Body::Chunk(c)) if c.data == b"hi"));
-        let r2 = events_rx.try_recv().unwrap();
+        let (h2, r2) = events_rx.try_recv().unwrap();
+        assert_eq!(h2, host);
         assert!(
             matches!(r2.body, Some(Body::Outcome(o)) if o.terminal == Some(Terminal::ExitCode(0)))
         );
@@ -1227,7 +1250,7 @@ mod tests {
         host: HostId,
         job_id: &str,
         deadline: Instant,
-    ) -> (PendingJobs, mpsc::Receiver<JobResult>) {
+    ) -> (PendingJobs, mpsc::Receiver<HostResult>) {
         let (tx, rx) = mpsc::channel(8);
         let mut pending: PendingJobs = HashMap::new();
         pending.insert(
@@ -1269,8 +1292,9 @@ mod tests {
             !pending.contains_key(&(stale_host, "old".into())),
             "stale job reaped"
         );
-        // The reaped job's operator got a terminal error.
-        let r = rx.try_recv().unwrap();
+        // The reaped job's operator got a terminal error, tagged with its host.
+        let (rhost, r) = rx.try_recv().unwrap();
+        assert_eq!(rhost, stale_host);
         assert!(
             matches!(r.body, Some(Body::Outcome(o)) if matches!(o.terminal, Some(Terminal::Error(_))))
         );
@@ -1303,7 +1327,8 @@ mod tests {
             pending.contains_key(&(host_b, "jb".into())),
             "other host's job kept"
         );
-        let r = rx_a.try_recv().unwrap();
+        let (rhost, r) = rx_a.try_recv().unwrap();
+        assert_eq!(rhost, host_a);
         assert!(
             matches!(r.body, Some(Body::Outcome(_))),
             "purged operator got a terminal event"
@@ -1527,9 +1552,10 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut terminal = None;
-        while let Ok(Some(r)) =
+        while let Ok(Some((rhost, r))) =
             tokio::time::timeout(StdDuration::from_secs(8), events_rx.recv()).await
         {
+            assert_eq!(rhost, host, "every result is tagged with its host");
             match r.body.unwrap() {
                 Body::Chunk(c) => stdout.extend(c.data),
                 Body::Outcome(o) => {
@@ -1548,5 +1574,112 @@ mod tests {
             "the exit code streamed back"
         );
         agent.abort();
+    }
+
+    /// Fan-out over the real broker: two agents come online, `OnlineHosts` returns
+    /// both, and a dispatch to each streams back results tagged with their host_id.
+    #[tokio::test]
+    async fn fan_out_dispatches_to_each_online_host_with_tagged_results() {
+        use osa_proto::v1::job_result::Body;
+        use osa_proto::v1::{Dispatch, ExecParams};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let server = ca.issue_server_cert(&["localhost"]).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+        std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+        std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+        let port = free_port();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        spawn(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            dir.path(),
+            ca.clone(),
+            Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        // Bring two agents online.
+        let host1 = HostId::new();
+        let host2 = HostId::new();
+        let mut agents = Vec::new();
+        for host in [host1, host2] {
+            let (cert, key) = enroll_host(&ca, host).await;
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            agents.push(tokio::spawn(play_agent_exec(
+                ca.clone(),
+                cert,
+                key,
+                host.0.to_string(),
+                port,
+                ready_tx,
+            )));
+            tokio::time::timeout(StdDuration::from_secs(8), ready_rx)
+                .await
+                .expect("agent online")
+                .unwrap();
+        }
+
+        // `*` resolution: the bridge reports both online hosts.
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(BridgeCommand::OnlineHosts { reply: otx })
+            .await
+            .unwrap();
+        let online = orx.await.unwrap();
+        assert_eq!(online.len(), 2);
+        assert!(online.contains(&host1) && online.contains(&host2));
+
+        // Fan out to the two online hosts AND one OFFLINE host (never connected),
+        // over one shared, tagged result stream.
+        let offline = HostId::new();
+        let (events_tx, mut events_rx) = mpsc::channel::<HostResult>(16);
+        for host in [host1, host2, offline] {
+            let params = osa_core::wire::encode(&ExecParams {
+                argv: vec!["echo".into(), "hi".into()],
+            });
+            cmd_tx
+                .send(BridgeCommand::Dispatch {
+                    host_id: host,
+                    dispatch: Dispatch {
+                        job_id: format!("job-{}", host.0),
+                        kind: "exec".into(),
+                        run_as: String::new(),
+                        params,
+                    },
+                    events: events_tx.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(events_tx);
+
+        // Each host reports a terminal outcome tagged with its host: the two online
+        // hosts exit 0; the offline host is reported "not connected" — without
+        // blocking the others.
+        let mut outcomes: std::collections::HashMap<HostId, Terminal> =
+            std::collections::HashMap::new();
+        while let Ok(Some((host, r))) =
+            tokio::time::timeout(StdDuration::from_secs(8), events_rx.recv()).await
+        {
+            if let Some(Body::Outcome(o)) = r.body
+                && let Some(t) = o.terminal
+            {
+                outcomes.insert(host, t);
+            }
+        }
+        assert_eq!(outcomes.get(&host1), Some(&Terminal::ExitCode(0)));
+        assert_eq!(outcomes.get(&host2), Some(&Terminal::ExitCode(0)));
+        assert!(
+            matches!(outcomes.get(&offline), Some(Terminal::Error(m)) if m.contains("not connected")),
+            "the offline host is reported as such: {:?}",
+            outcomes.get(&offline)
+        );
+        for a in agents {
+            a.abort();
+        }
     }
 }
