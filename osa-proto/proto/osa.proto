@@ -142,6 +142,12 @@ service Operator {
   // unauthorized dispatch is rejected PERMISSION_DENIED. v1 stubs the agent-side
   // execution — capabilities land in Epic 3+.
   rpc Dispatch(DispatchRequest) returns (DispatchResponse);
+  // Dispatch a capability action and **stream** its output back (Epic 3, CAP-2).
+  // Same authorize-then-audit as Dispatch; on allow, the coordinator seals the
+  // OPAQUE `params` to the target's live session and relays the agent's sealed
+  // results — output chunks in order, then one terminal outcome. PERMISSION_DENIED
+  // on an unauthorized action; a terminal error event if the host is offline.
+  rpc Exec(DispatchRequest) returns (stream ExecEvent);
   // Export the append-only, hash-chained audit log (AD-21) for independent
   // verification (`osa audit verify` recomputes the chain client-side).
   rpc ExportAudit(ExportAuditRequest) returns (ExportAuditResponse);
@@ -149,11 +155,23 @@ service Operator {
 
 message DispatchRequest {
   ActionDescriptor action = 1; // what to run, where, as whom (AD-12)
+  bytes params = 2;            // opaque capability params, sealed to the agent
+                               // unparsed (ExecParams for exec); the coordinator
+                               // authorizes on `action`, never on this (AD-12).
 }
 
 // Empty: reaching a response means the dispatch was authorized and accepted. A
 // denied dispatch is a PERMISSION_DENIED status, not a response.
 message DispatchResponse {}
+
+// One streamed event of an `Exec` dispatch: output as it is produced, then a
+// single terminal outcome (the agent's `OutputChunk`/`JobOutcome`, relayed).
+message ExecEvent {
+  oneof event {
+    OutputChunk chunk = 1;
+    JobOutcome outcome = 2;
+  }
+}
 
 message ExportAuditRequest {}
 

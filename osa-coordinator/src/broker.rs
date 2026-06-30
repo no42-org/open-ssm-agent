@@ -25,21 +25,59 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use osa_core::HostId;
-use osa_core::seal::Direction;
 use osa_core::topics::{
-    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, tenant_from_ctrl_up, tenant_from_heartbeat,
-    tenant_from_hs_up,
+    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, RESULT_UP_FILTER, tenant_from_ctrl_up,
+    tenant_from_heartbeat, tenant_from_hs_up, tenant_from_result_up,
 };
-use osa_proto::v1::{ClientHello, Envelope, ServerHello, envelope::Kind};
+use osa_proto::v1::job_outcome::Terminal;
+use osa_proto::v1::job_result::Body;
+use osa_proto::v1::{ClientHello, Dispatch, Envelope, JobOutcome, JobResult, ServerHello};
 use rumqttd::local::{LinkRx, LinkTx};
 use rumqttd::{
     Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
 };
-use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
+use tokio::sync::mpsc::{self, Sender, channel, error::TrySendError};
+use uuid::Uuid;
 
 use crate::ca::EmbeddedCa;
 use crate::revocation::Revocations;
 use crate::session::SessionStore;
+
+/// A command to the bridge from the operator-facing gRPC service. The service
+/// never touches the broker or session keys directly — it asks the bridge to seal
+/// a dispatch to a host and stream the host's results back.
+pub enum BridgeCommand {
+    /// Seal `dispatch` to `host_id`'s live session and stream its `JobResult`s
+    /// (output chunks, then one terminal outcome) back over `events`. The bridge
+    /// reports a terminal error outcome if the host has no live session.
+    Dispatch {
+        host_id: HostId,
+        dispatch: Dispatch,
+        events: mpsc::Sender<JobResult>,
+    },
+}
+
+/// One in-flight dispatched job: the operator's result-stream sender plus a
+/// deadline after which it is reaped (so an agent that dies mid-job, or a job that
+/// never sends a terminal outcome, cannot leak the entry forever).
+struct PendingJob {
+    events: mpsc::Sender<JobResult>,
+    deadline: Instant,
+}
+
+/// In-flight dispatched jobs, keyed by (host, job_id). An entry is removed on the
+/// job's terminal outcome, when its operator stream goes away, on a host reconnect
+/// (the old session's jobs can never complete), or by the stale-job sweep.
+type PendingJobs = HashMap<(HostId, String), PendingJob>;
+
+/// Cap on concurrently-pending dispatched jobs, so a flood of dispatches (or dead
+/// hosts) cannot grow the map without bound.
+const MAX_PENDING_JOBS: usize = 4096;
+/// A pending job with no terminal outcome by this age is reaped (with an error to
+/// the operator). Comfortably exceeds the agent's per-job timeout (300 s).
+const PENDING_TTL: Duration = Duration::from_secs(600);
+/// How often the bridge sweeps for stale pending jobs.
+const PENDING_SWEEP: Duration = Duration::from_secs(60);
 
 /// A host is considered to have come back online if its previous heartbeat was
 /// older than this (so transient gaps do not spam "online" logs).
@@ -73,6 +111,7 @@ pub fn spawn(
     cert_dir: &Path,
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
+    commands: mpsc::Receiver<BridgeCommand>,
 ) -> anyhow::Result<()> {
     let path = |name: &str| cert_dir.join(name).to_string_lossy().into_owned();
 
@@ -119,7 +158,12 @@ pub fn spawn(
     let (mut link_tx, link_rx) = broker
         .link("osa-coordinator-bridge")
         .context("creating broker bridge link")?;
-    for filter in [HEARTBEAT_FILTER, HS_UP_FILTER, CTRL_UP_FILTER] {
+    for filter in [
+        HEARTBEAT_FILTER,
+        HS_UP_FILTER,
+        CTRL_UP_FILTER,
+        RESULT_UP_FILTER,
+    ] {
         link_tx
             .subscribe(filter)
             .with_context(|| format!("subscribing bridge to {filter}"))?;
@@ -143,7 +187,7 @@ pub fn spawn(
         .name("osa-bridge-recv".to_string())
         .spawn(move || forward_events(link_rx, evt_tx))
         .context("spawning bridge receive thread")?;
-    tokio::spawn(run_bridge(evt_rx, link_tx, ca, revocations));
+    tokio::spawn(run_bridge(evt_rx, commands, link_tx, ca, revocations));
     Ok(())
 }
 
@@ -193,33 +237,50 @@ fn forward_events(mut rx: LinkRx, tx: Sender<(String, Vec<u8>)>) {
 /// work should move off the loop (a task per hello, sharing `link_tx`) when the
 /// dispatch path lands (slice 2 / Epic 3).
 async fn run_bridge(
-    mut rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    mut rx: mpsc::Receiver<(String, Vec<u8>)>,
+    mut commands: mpsc::Receiver<BridgeCommand>,
     mut link_tx: LinkTx,
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
 ) {
     let mut sessions = SessionStore::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
-    while let Some((topic, payload)) = rx.recv().await {
-        // The broker confines each host to its own tenant subtree, so a message on
-        // `/tenants/<t>/…` can only have come from the host whose cert O = <t> —
-        // the publisher's identity is authenticated by the broker (issue #16).
-        if let Some(tenant) = tenant_from_heartbeat(&topic) {
-            if record_heartbeat(&mut last_seen, tenant, Instant::now(), MAX_TRACKED_HOSTS) {
-                tracing::info!(%tenant, "host online (heartbeat)");
+    let mut pending: PendingJobs = HashMap::new();
+    let mut commands_open = true;
+    let mut sweep = tokio::time::interval(PENDING_SWEEP);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some((topic, payload)) = msg else { break };
+                // The broker confines each host to its own tenant subtree, so a
+                // message on `/tenants/<t>/…` can only have come from the host whose
+                // cert O = <t> — the publisher is broker-authenticated (issue #16).
+                if let Some(tenant) = tenant_from_heartbeat(&topic) {
+                    if record_heartbeat(&mut last_seen, tenant, Instant::now(), MAX_TRACKED_HOSTS) {
+                        tracing::info!(%tenant, "host online (heartbeat)");
+                    }
+                } else if let Some(tenant) = tenant_from_hs_up(&topic) {
+                    if let Some(host) = handle_client_hello(
+                        tenant, &payload, &ca, revocations.as_ref(), &mut sessions, &mut link_tx,
+                    )
+                    .await
+                    {
+                        // A (re)established session means any prior jobs for this
+                        // host belong to a dead session — fail them, don't leak.
+                        purge_host_jobs(&mut pending, host);
+                    }
+                } else if tenant_from_ctrl_up(&topic).is_some() {
+                    handle_ctrl_ack(&payload, &mut sessions);
+                } else if let Some(tenant) = tenant_from_result_up(&topic) {
+                    handle_result(tenant, &payload, &mut sessions, &mut pending);
+                }
             }
-        } else if let Some(tenant) = tenant_from_hs_up(&topic) {
-            handle_client_hello(
-                tenant,
-                &payload,
-                &ca,
-                revocations.as_ref(),
-                &mut sessions,
-                &mut link_tx,
-            )
-            .await;
-        } else if tenant_from_ctrl_up(&topic).is_some() {
-            handle_ctrl_ack(&payload, &sessions);
+            cmd = commands.recv(), if commands_open => match cmd {
+                Some(cmd) => handle_command(cmd, &mut sessions, &mut pending, &mut link_tx),
+                None => commands_open = false, // service gone; keep serving the broker
+            },
+            _ = sweep.tick() => reap_stale_jobs(&mut pending),
         }
     }
     tracing::warn!("coordinator bridge stopped");
@@ -227,8 +288,10 @@ async fn run_bridge(
 
 /// Handle a `ClientHello` (#20): verify the agent cert (chain + validity +
 /// tenant-binding + revocation), run the authenticated handshake, publish the
-/// `ServerHello`, seal the session-ready beacon, and record the session. Any
-/// failure drops the handshake silently (an untrusted broker can feed garbage).
+/// `ServerHello`, seal the session-ready beacon, and record the session. Returns
+/// the established `HostId` on success (so the caller can purge that host's stale
+/// jobs), or `None` if the handshake was dropped (an untrusted broker can feed
+/// garbage — every failure drops silently).
 async fn handle_client_hello(
     tenant: &str,
     payload: &[u8],
@@ -236,19 +299,19 @@ async fn handle_client_hello(
     revocations: &dyn Revocations,
     sessions: &mut SessionStore,
     link_tx: &mut LinkTx,
-) {
+) -> Option<HostId> {
     let hello: ClientHello = match osa_core::wire::decode(payload) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(error = %e, "dropping malformed ClientHello");
-            return;
+            return None;
         }
     };
     let client_eph: [u8; 32] = match <[u8; 32]>::try_from(hello.client_eph.as_slice()) {
         Ok(a) => a,
         Err(_) => {
             tracing::warn!("ClientHello ephemeral is not 32 bytes — dropping");
-            return;
+            return None;
         }
     };
     // Sanity-bound the agent-chosen sid (it becomes the cleartext envelope sid and
@@ -256,14 +319,14 @@ async fn handle_client_hello(
     // against an empty or absurdly large value.
     if hello.sid.is_empty() || hello.sid.len() > 128 {
         tracing::warn!("ClientHello sid is empty or too long — dropping");
-        return;
+        return None;
     }
     // Chain + validity. The cert is the agent's claimed identity.
     let verified = match ca.verify_host_cert(&hello.cert_der) {
         Ok(v) => v,
         Err(e) => {
             tracing::info!(error = %e, "rejecting ClientHello: cert did not verify");
-            return;
+            return None;
         }
     };
     // Tenant binding: the broker-authenticated tenant (the topic) MUST equal the
@@ -271,7 +334,7 @@ async fn handle_client_hello(
     let host_str = verified.host_id.0.to_string();
     if osa_core::topics::tenant(&host_str) != tenant {
         tracing::warn!(%tenant, host = %host_str, "ClientHello cert/tenant mismatch — dropping");
-        return;
+        return None;
     }
     // Replay guard: a ClientHello whose sid already matches this host's live
     // session is a replay (a genuine reconnect mints a fresh sid). Drop it before
@@ -282,18 +345,18 @@ async fn handle_client_hello(
         .is_some_and(|s| s.sid == hello.sid)
     {
         tracing::warn!(host = %host_str, "duplicate ClientHello sid — replay, dropping");
-        return;
+        return None;
     }
     // Revocation (defense in depth, AD-28). Fail closed: no session on store error.
     match revocations.is_revoked(verified.host_id).await {
         Ok(false) => {}
         Ok(true) => {
             tracing::info!(host = %host_str, "rejecting ClientHello: identity revoked");
-            return;
+            return None;
         }
         Err(e) => {
             tracing::error!(error = %e, "revocation check failed — refusing session");
-            return;
+            return None;
         }
     }
     let resp = match ca.respond_handshake(
@@ -306,7 +369,7 @@ async fn handle_client_hello(
         Ok(r) => r,
         Err(e) => {
             tracing::info!(error = %e, host = %host_str, "rejecting ClientHello: handshake failed");
-            return;
+            return None;
         }
     };
     // Reserve (store) the session BEFORE emitting anything the agent treats as
@@ -314,12 +377,9 @@ async fn handle_client_hello(
     // live session the coordinator never tracked.
     if !sessions.insert(verified.host_id, hello.sid.clone(), resp.keys) {
         tracing::warn!(host = %host_str, "session store at capacity — refusing session");
-        return;
+        return None;
     }
-    let session = sessions
-        .get(&verified.host_id)
-        .expect("session was just inserted");
-    // ServerHello on the handshake downlink.
+    // ServerHello (cleartext, signature-authenticated) on the handshake downlink.
     let server_hello = ServerHello {
         sid: hello.sid.clone(),
         server_eph: resp.server_eph.to_vec(),
@@ -330,32 +390,25 @@ async fn handle_client_hello(
         osa_core::wire::encode(&server_hello),
     ) {
         tracing::warn!(error = %e, host = %host_str, "publishing ServerHello failed");
-        return;
+        return None;
     }
-    // The first sealed payload: a session-ready beacon on the control downlink,
-    // proving key agreement to the agent (seq 0, coordinator→agent direction).
-    let beacon = osa_core::wire::seal_envelope(
-        &session.keys,
-        Direction::CoordToAgent,
-        &host_str,
-        &hello.sid,
-        0,
-        Kind::Control,
-        osa_core::wire::CTRL_SESSION_READY,
-    );
-    if let Err(e) = link_tx.publish(
-        osa_core::topics::ctrl_down(&host_str),
-        osa_core::wire::encode(&beacon),
-    ) {
+    // The first sealed payload: a session-ready beacon on the control downlink
+    // (seq 0 from the session's downlink allocator), proving key agreement.
+    let session = sessions
+        .get_mut(&verified.host_id)
+        .expect("session was just inserted");
+    let beacon = session.seal_downlink(&host_str, osa_core::wire::CTRL_SESSION_READY);
+    if let Err(e) = link_tx.publish(osa_core::topics::ctrl_down(&host_str), beacon) {
         tracing::warn!(error = %e, host = %host_str, "publishing session-ready beacon failed");
     }
     tracing::info!(host = %host_str, "session established (authenticated handshake, #20)");
+    Some(verified.host_id)
 }
 
 /// Handle a sealed control ack on the uplink (#20): open it against the host's
-/// session keys. A successful open with the expected payload proves the agent
-/// derived matching keys — the end-to-end sealed channel is live.
-fn handle_ctrl_ack(payload: &[u8], sessions: &SessionStore) {
+/// session keys (authenticating before advancing the replay guard). A successful
+/// open with the expected payload proves the agent derived matching keys.
+fn handle_ctrl_ack(payload: &[u8], sessions: &mut SessionStore) {
     let env: Envelope = match osa_core::wire::decode(payload) {
         Ok(e) => e,
         Err(e) => {
@@ -363,14 +416,14 @@ fn handle_ctrl_ack(payload: &[u8], sessions: &SessionStore) {
             return;
         }
     };
-    let host_id = match env.host_id.parse::<uuid::Uuid>().map(HostId) {
+    let host_id = match env.host_id.parse::<Uuid>().map(HostId) {
         Ok(h) => h,
         Err(_) => {
             tracing::warn!("control envelope host_id is not a UUID — dropping");
             return;
         }
     };
-    let Some(session) = sessions.get(&host_id) else {
+    let Some(session) = sessions.get_mut(&host_id) else {
         tracing::warn!(host = %host_id.0, "control ack for an unknown session — dropping");
         return;
     };
@@ -378,14 +431,161 @@ fn handle_ctrl_ack(payload: &[u8], sessions: &SessionStore) {
         tracing::warn!(host = %host_id.0, "control ack sid mismatch — dropping");
         return;
     }
-    match osa_core::wire::open_envelope(&session.keys, Direction::AgentToCoord, &env) {
-        Ok(pt) if pt == osa_core::wire::CTRL_SESSION_ACK => {
+    match session.open_uplink(&env) {
+        Some(pt) if pt == osa_core::wire::CTRL_SESSION_ACK => {
             tracing::info!(host = %host_id.0, "session-open confirmed by agent (E2E sealed channel live, #20)");
         }
-        Ok(_) => tracing::warn!(host = %host_id.0, "unexpected sealed control payload"),
-        Err(_) => {
-            tracing::warn!(host = %host_id.0, "session-open ack failed to open — key mismatch?")
+        Some(_) => tracing::warn!(host = %host_id.0, "unexpected sealed control payload"),
+        None => {
+            tracing::warn!(host = %host_id.0, "session-open ack failed to open or was replayed")
         }
+    }
+}
+
+/// Handle a `BridgeCommand` (Epic 3): seal a dispatch to a host's live session and
+/// register the operator's result stream. Reports a terminal error outcome if the
+/// host is offline or the publish fails — the operator is never left hanging.
+fn handle_command(
+    cmd: BridgeCommand,
+    sessions: &mut SessionStore,
+    pending: &mut PendingJobs,
+    link_tx: &mut LinkTx,
+) {
+    let BridgeCommand::Dispatch {
+        host_id,
+        dispatch,
+        events,
+    } = cmd;
+    let job_id = dispatch.job_id.clone();
+    let key = (host_id, job_id.clone());
+    // A job_id collision would orphan the first operator's stream; refuse it.
+    if pending.contains_key(&key) {
+        let _ = events.try_send(error_result(&job_id, "duplicate job_id"));
+        return;
+    }
+    if pending.len() >= MAX_PENDING_JOBS {
+        let _ = events.try_send(error_result(&job_id, "coordinator at job capacity"));
+        return;
+    }
+    let host_str = host_id.0.to_string();
+    let Some(session) = sessions.get_mut(&host_id) else {
+        let _ = events.try_send(error_result(&job_id, "host is not connected"));
+        return;
+    };
+    let sealed = session.seal_downlink(&host_str, &osa_core::wire::encode(&dispatch));
+    if let Err(e) = link_tx.publish(osa_core::topics::dispatch_down(&host_str), sealed) {
+        tracing::warn!(error = %e, host = %host_str, %job_id, "publishing dispatch failed");
+        let _ = events.try_send(error_result(&job_id, "failed to reach the host"));
+        return;
+    }
+    pending.insert(
+        key,
+        PendingJob {
+            events,
+            deadline: Instant::now() + PENDING_TTL,
+        },
+    );
+    tracing::info!(host = %host_str, %job_id, kind = %dispatch.kind, "dispatched to agent");
+}
+
+/// Handle a sealed `JobResult` on the result uplink (Epic 3): open it against the
+/// host's session keys and route it to the waiting operator's stream by job_id. On
+/// the terminal outcome, the job is forgotten (which closes the operator stream).
+fn handle_result(
+    tenant: &str,
+    payload: &[u8],
+    sessions: &mut SessionStore,
+    pending: &mut PendingJobs,
+) {
+    let Ok(host_id) = Uuid::parse_str(tenant).map(HostId) else {
+        tracing::warn!(%tenant, "result tenant is not a UUID — dropping");
+        return;
+    };
+    let env: Envelope = match osa_core::wire::decode(payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping malformed result envelope");
+            return;
+        }
+    };
+    let Some(session) = sessions.get_mut(&host_id) else {
+        return; // a result for a host with no live session
+    };
+    let Some(plaintext) = session.open_uplink(&env) else {
+        return; // bad tag or replay/stale seq
+    };
+    let result: JobResult = match osa_core::wire::decode(&plaintext) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, host = %host_id.0, "dropping undecodable JobResult");
+            return;
+        }
+    };
+    let key = (host_id, result.job_id.clone());
+    let Some(job) = pending.get(&key) else {
+        tracing::debug!(host = %host_id.0, job_id = %key.1, "result for an unknown/finished job — dropping");
+        return;
+    };
+    let terminal = matches!(result.body, Some(Body::Outcome(_)));
+    match job.events.try_send(result) {
+        Ok(()) => {
+            if terminal {
+                pending.remove(&key); // closes the operator stream
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            pending.remove(&key); // operator disconnected; forget the job
+        }
+        Err(TrySendError::Full(_)) => {
+            // The operator cannot keep up. Rather than silently corrupt its output
+            // (a missing chunk) or buffer without bound, abort the job: drop it so
+            // its stream ends, and the operator reports an incomplete run.
+            tracing::warn!(host = %host_id.0, job_id = %key.1, "operator result stream full — aborting job");
+            pending.remove(&key);
+        }
+    }
+}
+
+/// Fail and forget every pending job for `host` — used when the host reconnects
+/// (its old session's jobs can never produce a result against the new keys).
+fn purge_host_jobs(pending: &mut PendingJobs, host: HostId) {
+    pending.retain(|(h, job_id), job| {
+        if *h == host {
+            let _ = job
+                .events
+                .try_send(error_result(job_id, "host reconnected; job interrupted"));
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Reap pending jobs past their deadline (an agent that died or never sent a
+/// terminal outcome), failing each so the operator is not left hanging.
+fn reap_stale_jobs(pending: &mut PendingJobs) {
+    let now = Instant::now();
+    pending.retain(|(_, job_id), job| {
+        if now >= job.deadline {
+            let _ = job
+                .events
+                .try_send(error_result(job_id, "no result from host (timed out)"));
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// A terminal `JobResult` carrying a capability/transport error for the operator.
+fn error_result(job_id: &str, msg: &str) -> JobResult {
+    JobResult {
+        job_id: job_id.to_string(),
+        body: Some(Body::Outcome(JobOutcome {
+            terminal: Some(Terminal::Error(msg.to_string())),
+            output_truncated: false,
+            timed_out: false,
+        })),
     }
 }
 
@@ -590,11 +790,13 @@ mod tests {
         let port = free_port();
         // This test exercises tenant isolation, not the handshake, so the bridge's
         // CA/revocation deps are throwaway (no ClientHello is ever sent).
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         spawn(
             format!("127.0.0.1:{port}").parse().unwrap(),
             dir.path(),
             Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap()),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
         )
         .unwrap();
         tokio::time::sleep(StdDuration::from_millis(400)).await;
@@ -668,11 +870,13 @@ mod tests {
         std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
         std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
         let port = free_port();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         spawn(
             format!("127.0.0.1:{port}").parse().unwrap(),
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
         )
         .unwrap();
         tokio::time::sleep(StdDuration::from_millis(400)).await;
@@ -869,11 +1073,13 @@ mod tests {
         std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
         let port = free_port();
         let revocations = Arc::new(RevocationRegistry::new());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         spawn(
             format!("127.0.0.1:{port}").parse().unwrap(),
             dir.path(),
             ca.clone(),
             revocations.clone(),
+            cmd_rx,
         )
         .unwrap();
         tokio::time::sleep(StdDuration::from_millis(400)).await;
@@ -930,5 +1136,417 @@ mod tests {
             .await,
             "the bridge must keep serving legitimate hosts after rejecting bad input"
         );
+    }
+
+    // --- Dispatch + result routing (Epic 3, slice 3.2b) ---
+
+    /// A coordinator/agent session key pair deriving identical keys.
+    fn session_keys_pair() -> (osa_core::seal::SessionKeys, osa_core::seal::SessionKeys) {
+        use osa_core::seal::Handshake;
+        let a = Handshake::new().unwrap();
+        let b = Handshake::new().unwrap();
+        let (apub, bpub) = (a.public, b.public);
+        (
+            a.derive(&bpub, b"bind").unwrap(),
+            b.derive(&apub, b"bind").unwrap(),
+        )
+    }
+
+    #[test]
+    fn handle_result_opens_and_routes_to_the_waiting_operator_then_forgets_on_terminal() {
+        use osa_core::seal::Direction;
+        use osa_proto::v1::job_outcome::Terminal;
+        use osa_proto::v1::job_result::Body;
+        use osa_proto::v1::output_chunk::Stream;
+        use osa_proto::v1::{JobResult, OutputChunk};
+
+        let (coord_keys, agent_keys) = session_keys_pair();
+        let host = HostId::new();
+        let mut sessions = SessionStore::new();
+        sessions.insert(host, "s".into(), coord_keys);
+        let tenant = osa_core::topics::tenant(&host.0.to_string());
+
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let mut pending: PendingJobs = HashMap::new();
+        pending.insert(
+            (host, "j1".into()),
+            PendingJob {
+                events: events_tx,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        // The agent seals an OutputChunk (seq 0) then a terminal JobOutcome (seq 1).
+        let seal = |seq: u64, body: Body| {
+            let result = JobResult {
+                job_id: "j1".into(),
+                body: Some(body),
+            };
+            let env = osa_core::wire::seal_envelope(
+                &agent_keys,
+                Direction::AgentToCoord,
+                &host.0.to_string(),
+                "s",
+                seq,
+                osa_proto::v1::envelope::Kind::Control,
+                &osa_core::wire::encode(&result),
+            );
+            osa_core::wire::encode(&env)
+        };
+        let chunk = seal(
+            0,
+            Body::Chunk(OutputChunk {
+                stream: Stream::Stdout as i32,
+                data: b"hi".to_vec(),
+            }),
+        );
+        let outcome = seal(
+            1,
+            Body::Outcome(osa_proto::v1::JobOutcome {
+                terminal: Some(Terminal::ExitCode(0)),
+                output_truncated: false,
+                timed_out: false,
+            }),
+        );
+
+        handle_result(&tenant, &chunk, &mut sessions, &mut pending);
+        assert!(!pending.is_empty(), "job still open after a chunk");
+        handle_result(&tenant, &outcome, &mut sessions, &mut pending);
+        assert!(pending.is_empty(), "job forgotten on the terminal outcome");
+
+        // The operator received the chunk then the outcome, in order.
+        let r1 = events_rx.try_recv().unwrap();
+        assert!(matches!(r1.body, Some(Body::Chunk(c)) if c.data == b"hi"));
+        let r2 = events_rx.try_recv().unwrap();
+        assert!(
+            matches!(r2.body, Some(Body::Outcome(o)) if o.terminal == Some(Terminal::ExitCode(0)))
+        );
+    }
+
+    fn pending_with(
+        host: HostId,
+        job_id: &str,
+        deadline: Instant,
+    ) -> (PendingJobs, mpsc::Receiver<JobResult>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut pending: PendingJobs = HashMap::new();
+        pending.insert(
+            (host, job_id.into()),
+            PendingJob {
+                events: tx,
+                deadline,
+            },
+        );
+        (pending, rx)
+    }
+
+    #[test]
+    fn reap_stale_jobs_fails_expired_jobs_and_leaves_fresh_ones() {
+        use osa_proto::v1::job_outcome::Terminal;
+        use osa_proto::v1::job_result::Body;
+
+        let stale_host = HostId::new();
+        let (mut pending, mut rx) =
+            pending_with(stale_host, "old", Instant::now() - Duration::from_secs(1));
+        // A fresh job that must survive the sweep.
+        let (fresh_tx, _fresh_rx) = mpsc::channel(8);
+        let fresh_host = HostId::new();
+        pending.insert(
+            (fresh_host, "new".into()),
+            PendingJob {
+                events: fresh_tx,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        reap_stale_jobs(&mut pending);
+
+        assert!(
+            pending.contains_key(&(fresh_host, "new".into())),
+            "fresh job kept"
+        );
+        assert!(
+            !pending.contains_key(&(stale_host, "old".into())),
+            "stale job reaped"
+        );
+        // The reaped job's operator got a terminal error.
+        let r = rx.try_recv().unwrap();
+        assert!(
+            matches!(r.body, Some(Body::Outcome(o)) if matches!(o.terminal, Some(Terminal::Error(_))))
+        );
+    }
+
+    #[test]
+    fn purge_host_jobs_fails_only_the_reconnecting_hosts_jobs() {
+        use osa_proto::v1::job_result::Body;
+
+        let host_a = HostId::new();
+        let host_b = HostId::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut pending, mut rx_a) = pending_with(host_a, "ja", deadline);
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        pending.insert(
+            (host_b, "jb".into()),
+            PendingJob {
+                events: tx_b,
+                deadline,
+            },
+        );
+
+        purge_host_jobs(&mut pending, host_a);
+
+        assert!(
+            !pending.contains_key(&(host_a, "ja".into())),
+            "reconnecting host's job purged"
+        );
+        assert!(
+            pending.contains_key(&(host_b, "jb".into())),
+            "other host's job kept"
+        );
+        let r = rx_a.try_recv().unwrap();
+        assert!(
+            matches!(r.body, Some(Body::Outcome(_))),
+            "purged operator got a terminal event"
+        );
+    }
+
+    /// Play a real agent over the broker: handshake, ack, then on a sealed dispatch
+    /// echo `argv` joined as stdout + a clean exit, all sealed on the uplink.
+    async fn play_agent_exec(
+        ca: Arc<EmbeddedCa>,
+        cert_der: Vec<u8>,
+        key: rcgen::KeyPair,
+        host_str: String,
+        port: u16,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) {
+        use osa_core::handshake::Initiator;
+        use osa_core::seal::{Direction, SessionKeys};
+        use osa_core::topics;
+        use osa_core::wire;
+        use osa_proto::v1::envelope::Kind;
+        use osa_proto::v1::job_outcome::Terminal;
+        use osa_proto::v1::job_result::Body;
+        use osa_proto::v1::output_chunk::Stream as OutStream;
+        use osa_proto::v1::{
+            ClientHello, Dispatch, Envelope, ExecParams, JobOutcome, JobResult, OutputChunk,
+            ServerHello,
+        };
+        use x509_parser::prelude::FromDer;
+
+        let cert_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_der.clone())).into_bytes();
+        let mut opts = MqttOptions::new(host_str.clone(), "localhost", port);
+        opts.set_keep_alive(StdDuration::from_secs(30));
+        opts.set_transport(Transport::tls(
+            ca.ca_root_pem().into_bytes(),
+            Some((cert_pem, key.serialize_pem().into_bytes())),
+            None,
+        ));
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+
+        let ca_pub = {
+            let der = ca.ca_root_der();
+            let (_, root) = x509_parser::prelude::X509Certificate::from_der(&der).unwrap();
+            root.public_key().subject_public_key.data.to_vec()
+        };
+        let sid = "exec-itest";
+        let (mut initiator, hello) =
+            Initiator::start(sid.as_bytes(), &cert_der, &key.serialize_pem())
+                .map(|(i, h)| (Some(i), h))
+                .unwrap();
+        let client_hello = ClientHello {
+            sid: sid.into(),
+            client_eph: hello.client_eph.to_vec(),
+            cert_der: cert_der.clone(),
+            sig: hello.sig,
+        };
+
+        let mut keys: Option<SessionKeys> = None;
+        let mut send_seq = 0u64;
+        let mut ready = Some(ready);
+        let seal_uplink = |keys: &SessionKeys, seq: &mut u64, payload: &[u8]| {
+            let env = wire::seal_envelope(
+                keys,
+                Direction::AgentToCoord,
+                &host_str,
+                sid,
+                *seq,
+                Kind::Control,
+                payload,
+            );
+            *seq += 1;
+            wire::encode(&env)
+        };
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    for t in [
+                        topics::hs_down(&host_str),
+                        topics::ctrl_down(&host_str),
+                        topics::dispatch_down(&host_str),
+                    ] {
+                        client.subscribe(t, QoS::AtLeastOnce).await.unwrap();
+                    }
+                    client
+                        .publish(
+                            topics::hs_up(&host_str),
+                            QoS::AtLeastOnce,
+                            false,
+                            wire::encode(&client_hello),
+                        )
+                        .await
+                        .unwrap();
+                }
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    if p.topic == topics::hs_down(&host_str) {
+                        let sh: ServerHello = wire::decode(&p.payload).unwrap();
+                        let server_eph: [u8; 32] = sh.server_eph.as_slice().try_into().unwrap();
+                        keys = Some(
+                            initiator
+                                .take()
+                                .unwrap()
+                                .finish(&server_eph, &sh.sig, &ca_pub)
+                                .unwrap(),
+                        );
+                    } else if p.topic == topics::ctrl_down(&host_str) {
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        let k = keys.as_ref().unwrap();
+                        wire::open_envelope(k, Direction::CoordToAgent, &env).unwrap();
+                        let ack = seal_uplink(k, &mut send_seq, wire::CTRL_SESSION_ACK);
+                        client
+                            .publish(topics::ctrl_up(&host_str), QoS::AtLeastOnce, false, ack)
+                            .await
+                            .unwrap();
+                        if let Some(r) = ready.take() {
+                            let _ = r.send(());
+                        }
+                    } else if p.topic == topics::dispatch_down(&host_str) {
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        let k = keys.as_ref().unwrap();
+                        let pt = wire::open_envelope(k, Direction::CoordToAgent, &env).unwrap();
+                        let dispatch: Dispatch = wire::decode(&pt).unwrap();
+                        let params: ExecParams = wire::decode(&dispatch.params).unwrap();
+                        let out = params.argv.join(" ").into_bytes();
+                        let chunk = JobResult {
+                            job_id: dispatch.job_id.clone(),
+                            body: Some(Body::Chunk(OutputChunk {
+                                stream: OutStream::Stdout as i32,
+                                data: out,
+                            })),
+                        };
+                        let b = seal_uplink(k, &mut send_seq, &wire::encode(&chunk));
+                        client
+                            .publish(topics::result_up(&host_str), QoS::AtLeastOnce, false, b)
+                            .await
+                            .unwrap();
+                        let outcome = JobResult {
+                            job_id: dispatch.job_id.clone(),
+                            body: Some(Body::Outcome(JobOutcome {
+                                terminal: Some(Terminal::ExitCode(0)),
+                                output_truncated: false,
+                                timed_out: false,
+                            })),
+                        };
+                        let b = seal_uplink(k, &mut send_seq, &wire::encode(&outcome));
+                        client
+                            .publish(topics::result_up(&host_str), QoS::AtLeastOnce, false, b)
+                            .await
+                            .unwrap();
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// End-to-end over the real broker: an operator dispatch flows through the
+    /// bridge to a live agent and its sealed output + exit code stream back.
+    #[tokio::test]
+    async fn an_operator_exec_streams_output_end_to_end() {
+        use osa_proto::v1::job_outcome::Terminal;
+        use osa_proto::v1::job_result::Body;
+        use osa_proto::v1::{Dispatch, ExecParams};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let server = ca.issue_server_cert(&["localhost"]).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+        std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+        std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+        let port = free_port();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        spawn(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            dir.path(),
+            ca.clone(),
+            Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        let host = HostId::new();
+        let (cert_der, key) = enroll_host(&ca, host).await;
+        let host_str = host.0.to_string();
+
+        // Bring a real agent online (handshake + ack) and wait until it is ready.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let agent = tokio::spawn(play_agent_exec(
+            ca.clone(),
+            cert_der,
+            key,
+            host_str,
+            port,
+            ready_tx,
+        ));
+        tokio::time::timeout(StdDuration::from_secs(8), ready_rx)
+            .await
+            .expect("agent should establish a session")
+            .unwrap();
+
+        // The operator dispatches an exec; the bridge seals it and streams results.
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let params = osa_core::wire::encode(&ExecParams {
+            argv: vec!["echo".into(), "hi".into()],
+        });
+        cmd_tx
+            .send(BridgeCommand::Dispatch {
+                host_id: host,
+                dispatch: Dispatch {
+                    job_id: "job-1".into(),
+                    kind: "exec".into(),
+                    run_as: String::new(),
+                    params,
+                },
+                events: events_tx,
+            })
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut terminal = None;
+        while let Ok(Some(r)) =
+            tokio::time::timeout(StdDuration::from_secs(8), events_rx.recv()).await
+        {
+            match r.body.unwrap() {
+                Body::Chunk(c) => stdout.extend(c.data),
+                Body::Outcome(o) => {
+                    terminal = o.terminal;
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            stdout, b"echo hi",
+            "the agent's sealed stdout streamed back"
+        );
+        assert_eq!(
+            terminal,
+            Some(Terminal::ExitCode(0)),
+            "the exit code streamed back"
+        );
+        agent.abort();
     }
 }

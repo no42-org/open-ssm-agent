@@ -16,6 +16,8 @@ path = "src/main.rs"
 osa-core.workspace = true
 osa-proto.workspace = true
 tokio.workspace = true
+# Adapt an mpsc receiver into the server-streaming Exec response (Epic 3).
+tokio-stream = "0.1.17"
 tonic.workspace = true
 clap.workspace = true
 tracing.workspace = true

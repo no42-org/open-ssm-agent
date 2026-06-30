@@ -45,11 +45,14 @@ fn authed<T>(msg: T, token: &Option<String>) -> anyhow::Result<tonic::Request<T>
 enum Command {
     /// Mint a short-TTL single-use join token for a new host (AD-25).
     Token,
-    /// Run a command on one or more hosts and collect the result (CAP-2).
+    /// Run a command on a host and stream its output back (CAP-2).
     Exec {
-        /// Host selector (host_id or tag/group, AD-19).
+        /// Target host_id (UUID). Host selectors/fan-out land in story 3.4.
         host: String,
-        /// Command line to execute on the target.
+        /// Target unix user; empty runs as the agent's own user.
+        #[arg(long, default_value = "")]
+        run_as: String,
+        /// Command line to execute on the target, after `--`.
         #[arg(last = true)]
         argv: Vec<String>,
     },
@@ -114,24 +117,82 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("revoked {host}");
         }
-        Command::Exec { host, .. } => {
+        Command::Exec { host, run_as, argv } => {
+            use osa_proto::v1::{exec_event::Event, job_outcome::Terminal, output_chunk::Stream};
+            use std::io::Write;
+
+            if argv.is_empty() {
+                anyhow::bail!("no command given — use: osa exec <host> -- <cmd> [args...]");
+            }
             let mut client =
                 osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
                     .await?;
-            client
-                .dispatch(authed(
-                    osa_proto::v1::DispatchRequest {
-                        action: Some(osa_proto::v1::ActionDescriptor {
-                            kind: "exec".into(),
-                            target: host.clone(),
-                            run_as: String::new(),
-                            params_hash: Vec::new(),
-                        }),
-                    },
-                    &cli.operator_token,
-                )?)
-                .await?;
-            println!("dispatch accepted for {host} (execution lands in Epic 3)");
+            // The capability params are opaque to the coordinator (AD-12): the CLI
+            // encodes ExecParams and the coordinator seals the bytes unparsed. The
+            // params_hash binds the authorized action to exactly these params.
+            let params = osa_core::wire::encode(&osa_proto::v1::ExecParams { argv });
+            let params_hash = osa_core::wire::params_hash(&params);
+            let req = authed(
+                osa_proto::v1::DispatchRequest {
+                    action: Some(osa_proto::v1::ActionDescriptor {
+                        kind: "exec".into(),
+                        target: host.clone(),
+                        run_as,
+                        params_hash,
+                    }),
+                    params,
+                },
+                &cli.operator_token,
+            )?;
+            let mut stream = client.exec(req).await?.into_inner();
+            let mut exit_code = 0;
+            let mut saw_outcome = false;
+            while let Some(event) = stream.message().await? {
+                match event.event {
+                    Some(Event::Chunk(chunk)) => {
+                        let to_stderr = chunk.stream() == Stream::Stderr;
+                        if to_stderr {
+                            std::io::stderr().write_all(&chunk.data)?;
+                        } else {
+                            let mut out = std::io::stdout();
+                            out.write_all(&chunk.data)?;
+                            out.flush()?;
+                        }
+                    }
+                    Some(Event::Outcome(outcome)) => {
+                        saw_outcome = true;
+                        if outcome.output_truncated {
+                            eprintln!("[osa: output truncated — job output cap hit]");
+                        }
+                        if outcome.timed_out {
+                            eprintln!("[osa: job timed out]");
+                        }
+                        match outcome.terminal {
+                            Some(Terminal::ExitCode(code)) => exit_code = code,
+                            Some(Terminal::Signal(sig)) => {
+                                eprintln!("[osa: terminated by signal {sig}]");
+                                exit_code = 128 + sig;
+                            }
+                            Some(Terminal::Error(msg)) => {
+                                eprintln!("[osa: exec failed: {msg}]");
+                                exit_code = 1;
+                            }
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+            // A stream that ends without a terminal status means the job did not
+            // complete cleanly (host dropped, coordinator aborted it): report a
+            // failure rather than a misleading exit 0.
+            if !saw_outcome {
+                eprintln!(
+                    "[osa: the connection ended before a terminal status — the job may not have completed]"
+                );
+                std::process::exit(1);
+            }
+            std::process::exit(exit_code);
         }
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
         Command::Audit {
