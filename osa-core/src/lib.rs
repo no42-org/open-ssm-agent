@@ -19,5 +19,6 @@ pub mod ports;
 pub mod seal;
 pub mod stream;
 pub mod topics;
+pub mod wire;
 
 pub use domain::{HostId, JobId, Sid};

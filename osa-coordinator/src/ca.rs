@@ -54,7 +54,19 @@ pub struct EmbeddedCa {
     issuer: Issuer<'static, KeyPair>,
     cert_der: Vec<u8>,
     cert_pem: String,
+    /// The CA signing key (PKCS#8 PEM). Held to sign session ServerHellos (#20);
+    /// the agent verifies them against the pinned CA root's public key. Already
+    /// online for CSR signing, so this is no new exposure (see
+    /// docs/design/session-handshake.md "Signing-key posture").
+    key_pem: String,
     cert_ttl: Duration,
+}
+
+/// A host certificate that verified against this CA: its identity and the ECDSA
+/// P-256 public key (SEC1 point) the handshake signature is checked against (#20).
+pub struct VerifiedHost {
+    pub host_id: HostId,
+    pub public_key_sec1: Vec<u8>,
 }
 
 /// The CA root certificate parameters (self-signed, long-lived, KeyCertSign).
@@ -128,8 +140,73 @@ impl EmbeddedCa {
             issuer,
             cert_der,
             cert_pem: cert_pem.to_string(),
+            key_pem: key_pem.to_string(),
             cert_ttl,
         })
+    }
+
+    /// Verify a host cert presented in a `ClientHello` (#20): it must chain to
+    /// this CA and be currently valid. Returns the host identity (from the SAN)
+    /// and its ECDSA P-256 public key in SEC1 form, for the handshake signature
+    /// check. Revocation and tenant-binding are the caller's (they need the async
+    /// [`Revocations`](crate::revocation::Revocations) port and the topic tenant).
+    pub fn verify_host_cert(&self, cert_der: &[u8]) -> Result<VerifiedHost, PortError> {
+        let (_, cert) = X509Certificate::from_der(cert_der)
+            .map_err(|_| PortError::Invalid("malformed host certificate".into()))?;
+        let ca_der = self.ca_root_der();
+        let (_, ca) =
+            X509Certificate::from_der(&ca_der).map_err(|e| PortError::Backend(e.to_string()))?;
+        cert.verify_signature(Some(ca.public_key()))
+            .map_err(|_| PortError::Invalid("host cert was not issued by this CA".into()))?;
+        if !cert.validity().is_valid() {
+            return Err(PortError::Invalid(
+                "host cert is expired or not yet valid".into(),
+            ));
+        }
+        let host_id = host_id_from_cert(&cert)?;
+        // Fail closed at the boundary if the key is not EC: for an EC
+        // SubjectPublicKey the BIT STRING contents are exactly the SEC1 point
+        // (0x04‖X‖Y) that `VerifyingKey::from_sec1_bytes` wants; for an RSA cert
+        // `.data` is a DER SEQUENCE that downstream would merely *reject*, so guard
+        // explicitly here. (The P-256 curve itself is enforced by `from_sec1_bytes`
+        // in the handshake verify.)
+        let public_key_sec1 = match cert.public_key().parsed() {
+            Ok(x509_parser::public_key::PublicKey::EC(point)) => point.data().to_vec(),
+            _ => {
+                return Err(PortError::Invalid(
+                    "host cert public key is not an EC key".into(),
+                ));
+            }
+        };
+        Ok(VerifiedHost {
+            host_id,
+            public_key_sec1,
+        })
+    }
+
+    /// Respond to a verified `ClientHello` (#20): verify the agent's signature
+    /// over its ephemeral, sign the `ServerHello` with the CA key, and derive the
+    /// session keys — all via the reviewed [`osa_core::handshake::respond`], so
+    /// the CA key never leaves this struct. `public_key_sec1`/`cert_der` come from
+    /// [`verify_host_cert`](Self::verify_host_cert) (the cert was already chain-
+    /// verified); `respond` then proves the agent holds that identity's key.
+    pub fn respond_handshake(
+        &self,
+        sid: &[u8],
+        client_eph: &[u8; 32],
+        client_sig: &[u8],
+        public_key_sec1: &[u8],
+        cert_der: &[u8],
+    ) -> Result<osa_core::handshake::ServerResponse, PortError> {
+        osa_core::handshake::respond(
+            sid,
+            client_eph,
+            client_sig,
+            public_key_sec1,
+            cert_der,
+            &self.key_pem,
+        )
+        .map_err(|e| PortError::Invalid(format!("session handshake failed: {e}")))
     }
 
     /// DER of the CA root certificate — delivered to agents in the join bundle
@@ -563,6 +640,88 @@ mod tests {
             EmbeddedCa::from_material(&material.cert_pem, &material.key_pem, Duration::ZERO),
             Err(PortError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn verify_host_cert_returns_identity_and_a_usable_pubkey() {
+        // A cert this CA issued verifies, yields its host_id, and the extracted
+        // SEC1 pubkey verifies a signature the host's own key made — i.e. it is
+        // exactly the key the handshake will check the ClientHello against (#20).
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let host = HostId::new();
+        let cert_der = ca.issue(host, &csr_with_key(&key)).unwrap();
+
+        let verified = ca.verify_host_cert(&cert_der).unwrap();
+        assert_eq!(verified.host_id, host);
+
+        let msg = b"osa/v1 hs c2s transcript";
+        let sig = osa_core::handshake::sign(&key.serialize_pem(), msg).unwrap();
+        osa_core::handshake::verify(&verified.public_key_sec1, msg, &sig)
+            .expect("extracted SEC1 pubkey must verify the host key's signature");
+    }
+
+    #[test]
+    fn verify_host_cert_rejects_a_foreign_or_malformed_cert() {
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let foreign_ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let foreign = foreign_ca
+            .issue(HostId::new(), &csr_with_key(&key))
+            .unwrap();
+        assert!(matches!(
+            ca.verify_host_cert(&foreign),
+            Err(PortError::Invalid(_))
+        ));
+        assert!(matches!(
+            ca.verify_host_cert(b"not a cert"),
+            Err(PortError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn respond_handshake_completes_a_real_initiator() {
+        // End-to-end through the CA: an agent runs Initiator::start with a
+        // CA-issued identity; the coordinator verifies the cert and responds; the
+        // agent finishes against the pinned CA root. Both sides derive the SAME
+        // session keys — a payload sealed by one opens with the other (#20).
+        use osa_core::handshake::Initiator;
+        use osa_core::seal::Direction;
+
+        let ca = EmbeddedCa::new(Duration::hours(24)).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let host = HostId::new();
+        let cert_der = ca.issue(host, &csr_with_key(&key)).unwrap();
+        let sid = b"session-1";
+
+        let (initiator, hello) = Initiator::start(sid, &cert_der, &key.serialize_pem()).unwrap();
+        let client_eph: [u8; 32] = hello.client_eph;
+
+        let verified = ca.verify_host_cert(&cert_der).unwrap();
+        let resp = ca
+            .respond_handshake(
+                sid,
+                &client_eph,
+                &hello.sig,
+                &verified.public_key_sec1,
+                &cert_der,
+            )
+            .unwrap();
+
+        let ca_der = ca.ca_root_der();
+        let (_, root) = X509Certificate::from_der(&ca_der).unwrap();
+        let ca_pub_sec1 = root.public_key().subject_public_key.data.to_vec();
+        let agent_keys = initiator
+            .finish(&resp.server_eph, &resp.sig, &ca_pub_sec1)
+            .unwrap();
+
+        let ct = resp.keys.seal(Direction::CoordToAgent, 0, b"h", b"ping");
+        assert_eq!(
+            agent_keys
+                .open(Direction::CoordToAgent, 0, b"h", &ct)
+                .unwrap(),
+            b"ping"
+        );
     }
 
     // --- Postgres shared-CA (testcontainers; needs Docker) ---

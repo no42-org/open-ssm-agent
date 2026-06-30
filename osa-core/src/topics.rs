@@ -24,6 +24,13 @@ pub const ROOT: &str = "osa/v1";
 /// host's heartbeat across all tenants.
 pub const HEARTBEAT_FILTER: &str = "/tenants/+/osa/v1/up/heartbeat";
 
+/// Filter matching every host's `ClientHello` (session handshake, #20).
+pub const HS_UP_FILTER: &str = "/tenants/+/osa/v1/up/hs";
+
+/// Filter matching every host's sealed control uplink (e.g. the session-open
+/// ack, #20).
+pub const CTRL_UP_FILTER: &str = "/tenants/+/osa/v1/up/ctrl";
+
 /// The broker tenant id for a host: its `host_id` with hyphens stripped, so it is
 /// alphanumeric as `validate-tenant-prefix` requires. Must equal the cert's O.
 pub fn tenant(host_id: &str) -> String {
@@ -41,12 +48,52 @@ pub fn heartbeat(host_id: &str) -> String {
     format!("{}{ROOT}/up/heartbeat", tenant_prefix(host_id))
 }
 
-/// Extract the tenant id (hyphen-stripped host_id) from a heartbeat topic, if it
-/// matches the scheme.
-pub fn tenant_from_heartbeat(topic: &str) -> Option<&str> {
+/// The handshake uplink: an agent publishes its `ClientHello` here (#20).
+pub fn hs_up(host_id: &str) -> String {
+    format!("{}{ROOT}/up/hs", tenant_prefix(host_id))
+}
+
+/// The handshake downlink: the coordinator publishes the `ServerHello` here, and
+/// the agent subscribes to it (#20).
+pub fn hs_down(host_id: &str) -> String {
+    format!("{}{ROOT}/down/hs", tenant_prefix(host_id))
+}
+
+/// The sealed control uplink: the agent publishes its session-open ack here, and
+/// the coordinator subscribes across all tenants via [`CTRL_UP_FILTER`] (#20).
+pub fn ctrl_up(host_id: &str) -> String {
+    format!("{}{ROOT}/up/ctrl", tenant_prefix(host_id))
+}
+
+/// The sealed control downlink: the coordinator publishes its session-ready
+/// beacon here, and the agent subscribes to it (#20).
+pub fn ctrl_down(host_id: &str) -> String {
+    format!("{}{ROOT}/down/ctrl", tenant_prefix(host_id))
+}
+
+/// Extract the tenant id (hyphen-stripped host_id) from a topic whose tail after
+/// the tenant segment equals `tail`. The broker confines each client to its own
+/// `/tenants/<O>/…` subtree, so a topic matching the scheme names the tenant that
+/// could have published it.
+fn tenant_for_tail<'a>(topic: &'a str, tail: &str) -> Option<&'a str> {
     let rest = topic.strip_prefix("/tenants/")?;
-    let (tenant, tail) = rest.split_once('/')?;
-    (tail == "osa/v1/up/heartbeat" && !tenant.is_empty()).then_some(tenant)
+    let (tenant, rest_tail) = rest.split_once('/')?;
+    (rest_tail == tail && !tenant.is_empty()).then_some(tenant)
+}
+
+/// Extract the tenant id from a heartbeat topic, if it matches the scheme.
+pub fn tenant_from_heartbeat(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/heartbeat")
+}
+
+/// Extract the tenant id from a `ClientHello` (handshake uplink) topic (#20).
+pub fn tenant_from_hs_up(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/hs")
+}
+
+/// Extract the tenant id from a sealed control uplink topic (#20).
+pub fn tenant_from_ctrl_up(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/ctrl")
 }
 
 #[cfg(test)]
@@ -99,5 +146,29 @@ mod tests {
             tenant_from_heartbeat("/tenants/x/osa/v1/up/heartbeat/extra"),
             None
         );
+    }
+
+    #[test]
+    fn handshake_and_control_topics_are_tenant_scoped_and_round_trip() {
+        let host = "11111111-2222-4333-8444-555555555555";
+        let t = tenant(host);
+        assert_eq!(hs_up(host), format!("/tenants/{t}/osa/v1/up/hs"));
+        assert_eq!(hs_down(host), format!("/tenants/{t}/osa/v1/down/hs"));
+        assert_eq!(ctrl_up(host), format!("/tenants/{t}/osa/v1/up/ctrl"));
+        assert_eq!(ctrl_down(host), format!("/tenants/{t}/osa/v1/down/ctrl"));
+        assert_eq!(tenant_from_hs_up(&hs_up(host)), Some(t.as_str()));
+        assert_eq!(tenant_from_ctrl_up(&ctrl_up(host)), Some(t.as_str()));
+        // The filters match the produced shapes.
+        assert_eq!(HS_UP_FILTER, "/tenants/+/osa/v1/up/hs");
+        assert_eq!(CTRL_UP_FILTER, "/tenants/+/osa/v1/up/ctrl");
+    }
+
+    #[test]
+    fn handshake_extractors_reject_the_wrong_channel() {
+        // A handshake extractor must not match a heartbeat (or a downlink) topic.
+        let host = "aaaa-bbbb";
+        assert_eq!(tenant_from_hs_up(&heartbeat(host)), None);
+        assert_eq!(tenant_from_hs_up(&hs_down(host)), None);
+        assert_eq!(tenant_from_ctrl_up(&hs_up(host)), None);
     }
 }
