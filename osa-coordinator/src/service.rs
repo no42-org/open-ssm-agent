@@ -30,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use crate::broker::BridgeCommand;
+use crate::broker::{BridgeCommand, HostResult};
 use crate::ca::EmbeddedCa;
 use crate::revocation::Revocations;
 use crate::token::{JoinTokens, MintError};
@@ -39,6 +39,9 @@ use crate::token::{JoinTokens, MintError};
 /// output bursts a slow operator hasn't drained yet; on sustained overrun the
 /// bridge aborts the job rather than corrupting output silently).
 const EXEC_EVENT_QUEUE: usize = 256;
+/// Cap on how many hosts one selector may fan out to, so a single request cannot
+/// drive an unbounded number of authz/audit writes + dispatches.
+const MAX_FANOUT: usize = 1024;
 
 /// Backs both gRPC services: the agent-facing `Enrollment` (self-authenticating)
 /// and the operator-facing `Operator` (OIDC/JWT-gated). Cloning is cheap — every
@@ -111,6 +114,45 @@ impl OperatorService {
             })?;
         Ok(decision)
     }
+
+    /// Resolve an exec target selector to host_ids (3.4). `*` → every host with a
+    /// live session (asked of the bridge); otherwise a comma-separated list of
+    /// host_id UUIDs. Tag/group selectors await the inventory (Epic 5).
+    async fn resolve(&self, selector: &str) -> Result<Vec<HostId>, Status> {
+        let mut hosts: Vec<HostId> = if selector == "*" {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.bridge
+                .send(BridgeCommand::OnlineHosts { reply: tx })
+                .await
+                .map_err(|_| Status::unavailable("dispatch bridge unavailable"))?;
+            rx.await
+                .map_err(|_| Status::unavailable("dispatch bridge unavailable"))?
+        } else {
+            let mut v = Vec::new();
+            for tok in selector.split(',') {
+                let tok = tok.trim();
+                if tok.is_empty() {
+                    continue; // tolerate trailing/empty tokens in the list
+                }
+                let host = tok
+                    .parse::<uuid::Uuid>()
+                    .map(HostId)
+                    .map_err(|_| Status::invalid_argument("selector token is not a host_id"))?;
+                v.push(host);
+            }
+            v
+        };
+        // De-duplicate: a host named twice must not run the command twice.
+        let mut seen = std::collections::HashSet::new();
+        hosts.retain(|h| seen.insert(*h));
+        if hosts.len() > MAX_FANOUT {
+            return Err(Status::invalid_argument(format!(
+                "selector resolves to {} hosts (max {MAX_FANOUT})",
+                hosts.len()
+            )));
+        }
+        Ok(hosts)
+    }
 }
 
 /// The operator (AD-18), bound by the auth interceptor; `anonymous` only when the
@@ -122,16 +164,36 @@ fn operator_of<T>(request: &Request<T>) -> String {
     )
 }
 
-/// Relay one agent `JobResult` as an operator-facing `ExecEvent` (drop the
-/// job_id — the operator's stream is already scoped to one job).
-fn to_exec_event(result: JobResult) -> ExecEvent {
+/// Relay one agent `JobResult` as an operator-facing `ExecEvent`, keyed to its
+/// host so a fan-out can interleave per-host results (the job_id is dropped — the
+/// host_id is what the operator demuxes on).
+fn to_exec_event(host: HostId, result: JobResult) -> ExecEvent {
     use osa_proto::v1::{exec_event, job_result};
     let event = match result.body {
         Some(job_result::Body::Chunk(c)) => Some(exec_event::Event::Chunk(c)),
         Some(job_result::Body::Outcome(o)) => Some(exec_event::Event::Outcome(o)),
         None => None,
     };
-    ExecEvent { event }
+    ExecEvent {
+        host_id: host.0.to_string(),
+        event,
+    }
+}
+
+/// A per-host terminal error result, surfaced as an event so the fan-out keeps
+/// streaming the other hosts (a denial, an authz/audit backend error, or an
+/// unreachable bridge — never an RPC-level abort that would mask partial runs).
+fn outcome_error(msg: &str) -> JobResult {
+    use osa_proto::v1::job_outcome::Terminal;
+    use osa_proto::v1::{JobOutcome, job_result::Body};
+    JobResult {
+        job_id: String::new(),
+        body: Some(Body::Outcome(JobOutcome {
+            terminal: Some(Terminal::Error(msg.to_string())),
+            output_truncated: false,
+            timed_out: false,
+        })),
+    }
 }
 
 /// The current wall-clock as unix seconds, for audit timestamps.
@@ -227,42 +289,75 @@ impl Operator for OperatorService {
         if action.kind.is_empty() {
             return Err(Status::invalid_argument("action kind is empty"));
         }
-        // A single host_id target for v1 (host selectors/fan-out are story 3.4). A
-        // malformed target is a client error (InvalidArgument), not an authz
-        // decision, so it is rejected here without an audit record.
-        let host_id = action
-            .target
-            .parse::<uuid::Uuid>()
-            .map(HostId)
-            .map_err(|_| Status::invalid_argument("target is not a host_id"))?;
-
-        // Same authorize-then-audit as Dispatch (allow AND deny), before any agent.
-        if self.authorize_and_audit(&subject, &action).await? == Decision::Deny {
-            tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, "exec denied");
-            return Err(Status::permission_denied("not authorized for this action"));
+        // Resolve the selector to host_ids: a single id, a comma-list, or "*" (all
+        // online). A malformed token is a client error, rejected without an audit.
+        let hosts = self.resolve(&action.target).await?;
+        if hosts.is_empty() {
+            return Err(Status::not_found("no hosts matched the selector"));
         }
 
-        // Mint a job id, seal the opaque params to the host's session via the
-        // bridge, and stream the host's results back as they arrive.
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let dispatch = Dispatch {
-            job_id: job_id.clone(),
-            kind: action.kind.clone(),
-            run_as: action.run_as.clone(),
-            params,
-        };
-        let (events_tx, events_rx) = mpsc::channel::<JobResult>(EXEC_EVENT_QUEUE);
-        self.bridge
-            .send(BridgeCommand::Dispatch {
-                host_id,
-                dispatch,
-                events: events_tx,
-            })
-            .await
-            .map_err(|_| Status::unavailable("dispatch bridge unavailable"))?;
-        tracing::info!(operator = %subject, kind = %action.kind, target = %action.target, %job_id, "exec dispatched");
+        // Fan out in a spawned task so the response stream is returned (and drained)
+        // immediately: the per-host loop authorizes + audits PER HOST (so the RBAC
+        // selectors compose), then dispatches each allowed+online host. Denied,
+        // unauthorizable, offline, and bridge-error hosts are each reported as a
+        // per-host terminal EVENT — never an RPC abort that would leave hosts that
+        // already ran unreported. Results share one stream, tagged with host_id.
+        let (events_tx, events_rx) = mpsc::channel::<HostResult>(EXEC_EVENT_QUEUE);
+        let svc = self.clone();
+        let kind = action.kind.clone();
+        let run_as = action.run_as.clone();
+        let params_hash = action.params_hash.clone();
+        tracing::info!(operator = %subject, kind = %kind, selector = %action.target, hosts = hosts.len(), "exec fanning out");
+        tokio::spawn(async move {
+            for host in hosts {
+                let per_host = ActionDescriptor {
+                    kind: kind.clone(),
+                    target: host.0.to_string(),
+                    run_as: run_as.clone(),
+                    params_hash: params_hash.clone(),
+                };
+                match svc.authorize_and_audit(&subject, &per_host).await {
+                    Ok(Decision::Allow) => {
+                        let dispatch = Dispatch {
+                            job_id: uuid::Uuid::new_v4().to_string(),
+                            kind: kind.clone(),
+                            run_as: run_as.clone(),
+                            params: params.clone(),
+                        };
+                        if svc
+                            .bridge
+                            .send(BridgeCommand::Dispatch {
+                                host_id: host,
+                                dispatch,
+                                events: events_tx.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            let _ = events_tx
+                                .send((host, outcome_error("dispatch bridge unavailable")))
+                                .await;
+                        }
+                    }
+                    Ok(Decision::Deny) => {
+                        tracing::info!(operator = %subject, host = %host.0, "exec denied for host");
+                        let _ = events_tx
+                            .send((host, outcome_error("not authorized for this host")))
+                            .await;
+                    }
+                    Err(status) => {
+                        tracing::error!(host = %host.0, error = %status.message(), "exec authorize/audit failed for host");
+                        let _ = events_tx
+                            .send((host, outcome_error("authorization unavailable")))
+                            .await;
+                    }
+                }
+            }
+            // events_tx drops here; the stream closes once every dispatched host's
+            // pending job completes (or is reaped).
+        });
 
-        let stream = ReceiverStream::new(events_rx).map(|r| Ok(to_exec_event(r)));
+        let stream = ReceiverStream::new(events_rx).map(|(host, jr)| Ok(to_exec_event(host, jr)));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -564,16 +659,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_is_denied_by_default_before_any_dispatch() {
-        // The streaming Exec shares authorize-then-audit: deny-all rejects it
-        // PERMISSION_DENIED before reaching the bridge.
-        let svc = service();
-        let err = svc
+    async fn exec_denied_emits_a_per_host_denied_event_and_no_dispatch() {
+        // Fan-out reports denial PER HOST (so a partial denial doesn't fail the
+        // whole RPC): deny-all yields a single denied outcome event, no dispatch.
+        use tokio_stream::StreamExt;
+        let svc = service(); // deny-all
+        let mut stream = svc
             .exec(dispatch_req(Some("alice@example"), "exec", HOST))
             .await
-            .err()
-            .expect("a denied exec must not open a stream");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            .expect("exec opens a stream")
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        assert_eq!(events.len(), 1, "one host, one denied outcome");
+        assert_eq!(events[0].host_id, HOST);
+        let Some(osa_proto::v1::exec_event::Event::Outcome(o)) = &events[0].event else {
+            panic!("expected a terminal outcome");
+        };
+        assert!(matches!(
+            &o.terminal,
+            Some(osa_proto::v1::job_outcome::Terminal::Error(m)) if m.contains("authorized")
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_parses_a_host_id_list_and_rejects_a_bad_token() {
+        let svc = service();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        let hosts = svc.resolve(&format!("{a}, {b}")).await.unwrap();
+        assert_eq!(hosts.len(), 2, "comma-separated host_ids resolve to each");
+        let err = svc.resolve("not-a-host-id").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

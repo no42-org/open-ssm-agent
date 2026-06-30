@@ -45,9 +45,9 @@ fn authed<T>(msg: T, token: &Option<String>) -> anyhow::Result<tonic::Request<T>
 enum Command {
     /// Mint a short-TTL single-use join token for a new host (AD-25).
     Token,
-    /// Run a command on a host and stream its output back (CAP-2).
+    /// Run a command across a host selector and stream per-host output (CAP-2).
     Exec {
-        /// Target host_id (UUID). Host selectors/fan-out land in story 3.4.
+        /// Host selector: a host_id, a comma-separated list, or `*` (all online).
         host: String,
         /// Target unix user; empty runs as the agent's own user.
         #[arg(long, default_value = "")]
@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
             use std::io::Write;
 
             if argv.is_empty() {
-                anyhow::bail!("no command given — use: osa exec <host> -- <cmd> [args...]");
+                anyhow::bail!("no command given — use: osa exec <selector> -- <cmd> [args...]");
             }
             let mut client =
                 osa_proto::v1::operator_client::OperatorClient::connect(cli.coordinator.clone())
@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 osa_proto::v1::DispatchRequest {
                     action: Some(osa_proto::v1::ActionDescriptor {
                         kind: "exec".into(),
-                        target: host.clone(),
+                        target: host.clone(), // a selector: a host_id, a comma-list, or "*"
                         run_as,
                         params_hash,
                     }),
@@ -145,13 +145,23 @@ async fn main() -> anyhow::Result<()> {
                 &cli.operator_token,
             )?;
             let mut stream = client.exec(req).await?.into_inner();
-            let mut exit_code = 0;
-            let mut saw_outcome = false;
+            // Per-host streaming: tag output (to stderr) when the producing host
+            // changes, and collect a per-host terminal status; exit non-zero if any
+            // host failed. NOTE: for a multi-host fan-out, redirecting stdout
+            // concatenates all hosts' output without in-band markers (the host
+            // headers go to stderr) — a structured `--json` mode is a follow-up.
+            let mut last_host: Option<String> = None;
+            let mut hosts_reported = 0usize;
+            let mut failures = 0usize;
             while let Some(event) = stream.message().await? {
+                let host = event.host_id;
                 match event.event {
                     Some(Event::Chunk(chunk)) => {
-                        let to_stderr = chunk.stream() == Stream::Stderr;
-                        if to_stderr {
+                        if last_host.as_deref() != Some(host.as_str()) {
+                            eprintln!("==> {host} <==");
+                            last_host = Some(host);
+                        }
+                        if chunk.stream() == Stream::Stderr {
                             std::io::stderr().write_all(&chunk.data)?;
                         } else {
                             let mut out = std::io::stdout();
@@ -160,39 +170,44 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Some(Event::Outcome(outcome)) => {
-                        saw_outcome = true;
+                        hosts_reported += 1;
+                        let mut flags = String::new();
                         if outcome.output_truncated {
-                            eprintln!("[osa: output truncated — job output cap hit]");
+                            flags.push_str(" [output truncated]");
                         }
                         if outcome.timed_out {
-                            eprintln!("[osa: job timed out]");
+                            flags.push_str(" [timed out]");
                         }
-                        match outcome.terminal {
-                            Some(Terminal::ExitCode(code)) => exit_code = code,
+                        let status = match outcome.terminal {
+                            Some(Terminal::ExitCode(0)) => "exit 0".to_string(),
+                            Some(Terminal::ExitCode(code)) => {
+                                failures += 1;
+                                format!("exit {code}")
+                            }
                             Some(Terminal::Signal(sig)) => {
-                                eprintln!("[osa: terminated by signal {sig}]");
-                                exit_code = 128 + sig;
+                                failures += 1;
+                                format!("signal {sig}")
                             }
                             Some(Terminal::Error(msg)) => {
-                                eprintln!("[osa: exec failed: {msg}]");
-                                exit_code = 1;
+                                failures += 1;
+                                format!("error: {msg}")
                             }
-                            None => {}
-                        }
+                            None => {
+                                failures += 1;
+                                "no status".to_string()
+                            }
+                        };
+                        eprintln!("[osa] {host}: {status}{flags}");
                     }
                     None => {}
                 }
             }
-            // A stream that ends without a terminal status means the job did not
-            // complete cleanly (host dropped, coordinator aborted it): report a
-            // failure rather than a misleading exit 0.
-            if !saw_outcome {
-                eprintln!(
-                    "[osa: the connection ended before a terminal status — the job may not have completed]"
-                );
-                std::process::exit(1);
-            }
-            std::process::exit(exit_code);
+            eprintln!("[osa] {hosts_reported} host(s) reported, {failures} failed");
+            std::process::exit(if failures == 0 && hosts_reported > 0 {
+                0
+            } else {
+                1
+            });
         }
         Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
         Command::Audit {
