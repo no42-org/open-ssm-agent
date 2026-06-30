@@ -26,6 +26,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 
 use crate::dispatch::{self, JobChannel};
+use crate::jobstore::JobStore;
 use crate::session::{AgentIdentity, Established, Handshaking};
 
 /// Bound on undelivered sealed job-result bytes queued for the publisher; the job
@@ -110,6 +111,10 @@ pub async fn run(
     let heartbeat_topic = osa_core::topics::heartbeat(&host_id);
     // Caps concurrent jobs across the agent's whole lifetime (survives reconnects).
     let job_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
+    // Durable, job_id-keyed state for crash-recoverable idempotent redelivery (3.3),
+    // plus the in-memory in-flight guard against concurrent redelivery.
+    let jobs = Arc::new(JobStore::new(state_dir).context("opening the job store")?);
+    let inflight = dispatch::new_inflight();
     tracing::info!(%host_id, broker = %format!("{broker_host}:{broker_port}"), "control channel: dialing broker (mTLS, outbound-only)");
 
     let mut attempt = 0u32;
@@ -180,6 +185,8 @@ pub async fn run(
                             &client,
                             &agent_id,
                             &backstop,
+                            &jobs,
+                            &inflight,
                             &job_permits,
                             &results_tx,
                             &topics,
@@ -306,6 +313,8 @@ fn on_publish(
     client: &AsyncClient,
     id: &AgentIdentity,
     backstop: &Arc<LocalAllowlist>,
+    jobs: &Arc<JobStore>,
+    inflight: &dispatch::InFlight,
     job_permits: &Arc<Semaphore>,
     results: &mpsc::Sender<Vec<u8>>,
     topics: &SessionTopics,
@@ -348,7 +357,16 @@ fn on_publish(
             tracing::warn!("control channel: dispatch before a session — ignoring");
             return;
         };
-        handle_dispatch(est, id, backstop, job_permits, results, payload);
+        handle_dispatch(
+            est,
+            id,
+            backstop,
+            jobs,
+            inflight,
+            job_permits,
+            results,
+            payload,
+        );
     }
 }
 
@@ -372,10 +390,13 @@ async fn publish_results(client: AsyncClient, mut rx: mpsc::Receiver<Vec<u8>>, t
 /// streams sealed results. Rejects a replayed/stale downlink `seq` (anti
 /// double-execution) before opening. Spawned so a long command never blocks the
 /// event loop.
+#[allow(clippy::too_many_arguments)]
 fn handle_dispatch(
     est: &mut Established,
     id: &AgentIdentity,
     backstop: &Arc<LocalAllowlist>,
+    jobs: &Arc<JobStore>,
+    inflight: &dispatch::InFlight,
     job_permits: &Arc<Semaphore>,
     results: &mpsc::Sender<Vec<u8>>,
     payload: &[u8],
@@ -419,9 +440,11 @@ fn handle_dispatch(
         sid: est.sid().to_string(),
     };
     let backstop = Arc::clone(backstop);
+    let jobs = Arc::clone(jobs);
+    let inflight = Arc::clone(inflight);
     tokio::spawn(async move {
         let _permit = permit; // held for the job's life; frees a slot on completion
-        dispatch::run_job(dispatch, backstop, channel).await;
+        dispatch::run_job(dispatch, backstop, jobs, inflight, channel).await;
     });
 }
 

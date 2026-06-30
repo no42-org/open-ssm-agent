@@ -43,6 +43,19 @@ pub fn params_hash(params: &[u8]) -> Vec<u8> {
     Sha256::digest(params).to_vec()
 }
 
+/// Lowercase-hex SHA-256 of `bytes` — e.g. to derive a safe, fixed-length
+/// filename from an untrusted identifier (no path traversal regardless of input).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Decode a protobuf message from an MQTT payload.
 pub fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, prost::DecodeError> {
     M::decode(bytes)

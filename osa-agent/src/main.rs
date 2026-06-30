@@ -20,6 +20,7 @@ mod control_channel;
 mod dispatch;
 mod enroll;
 mod exec;
+mod jobstore;
 mod session;
 
 #[derive(Parser)]
