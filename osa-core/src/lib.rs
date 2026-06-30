@@ -14,6 +14,7 @@ pub mod allowlist;
 pub mod audit;
 pub mod auth;
 pub mod domain;
+pub mod handshake;
 pub mod ports;
 pub mod seal;
 pub mod stream;
