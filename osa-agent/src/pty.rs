@@ -445,10 +445,10 @@ mod tests {
             // (`CHILD=<pid>`) arrives, and only the latter parses to a number.
             for (idx, _) in s.match_indices(prefix) {
                 let rest = &s[idx + prefix.len()..];
-                if let Some(nl) = rest.find('\n') {
-                    if let Ok(pid) = rest[..nl].trim().parse::<i32>() {
-                        return Some(pid);
-                    }
+                if let Some(nl) = rest.find('\n')
+                    && let Ok(pid) = rest[..nl].trim().parse::<i32>()
+                {
+                    return Some(pid);
                 }
             }
         }
