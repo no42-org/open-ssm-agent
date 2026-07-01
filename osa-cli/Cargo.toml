@@ -19,3 +19,8 @@ clap.workspace = true
 anyhow.workspace = true
 tonic.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Adapt the outbound `osa shell` keystroke channel into a client-streaming request.
+tokio-stream = "0.1.17"
+# Local terminal raw mode (`term`) + the TIOCGWINSZ size query for `osa shell`.
+nix = { version = "0.29", default-features = false, features = ["term"] }
+libc = "0.2"

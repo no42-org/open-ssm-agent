@@ -58,8 +58,11 @@ enum Command {
     },
     /// Open an interactive shell on a host (CAP-3).
     Shell {
-        /// Target host_id.
+        /// Target host_id (UUID).
         host: String,
+        /// Target unix user; empty runs the agent's own shell.
+        #[arg(long, default_value = "")]
+        run_as: String,
     },
     /// Revoke a host identity so it can no longer renew (AD-28).
     Revoke {
@@ -209,7 +212,25 @@ async fn main() -> anyhow::Result<()> {
                 1
             });
         }
-        Command::Shell { host } => println!("shell on {host}: scaffold — not yet implemented"),
+        Command::Shell { host, run_as } => {
+            // Enter raw mode BEFORE the session (so even the first keystrokes are raw)
+            // and restore it explicitly below — `process::exit` skips destructors.
+            let raw = RawMode::enable();
+            let result =
+                run_shell_session(cli.coordinator.clone(), cli.operator_token, host, run_as).await;
+            drop(raw); // restore the local terminal
+
+            // Exit the process directly rather than returning: the spawned stdin
+            // reader is parked in a blocking `read(2)` that runtime teardown would
+            // otherwise wait on (hanging the command until the next keypress).
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("osa shell: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Audit {
             command: AuditCommand::Verify { expect_head },
         } => {
@@ -256,6 +277,136 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Default terminal size for `osa shell` when the local size can't be queried
+/// (e.g. stdout is not a terminal).
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_COLS: u16 = 80;
+
+/// Run one interactive shell session: open the bidirectional `Shell` stream (with a
+/// `ShellOpen` sized to the local terminal), pump local stdin → `input` frames, and
+/// write `output` frames to stdout until the remote shell closes. The caller owns
+/// raw-mode setup/restore and process exit.
+async fn run_shell_session(
+    coordinator: String,
+    token: Option<String>,
+    host: String,
+    run_as: String,
+) -> anyhow::Result<()> {
+    use osa_proto::v1::shell_client_msg::Msg as ClientMsg;
+    use osa_proto::v1::shell_server_msg::Msg as ServerMsg;
+    use osa_proto::v1::{ShellClientMsg, ShellOpen};
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let mut client = osa_proto::v1::operator_client::OperatorClient::connect(coordinator).await?;
+
+    // Outbound stream: `ShellOpen` first (sized to the local terminal), then raw
+    // keystrokes (Ctrl-C flows through as a byte, not a local signal).
+    let (rows, cols) = terminal_size().unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+    let (tx, rx) = tokio::sync::mpsc::channel::<ShellClientMsg>(64);
+    tx.send(ShellClientMsg {
+        msg: Some(ClientMsg::Open(ShellOpen {
+            host_id: host,
+            run_as,
+            rows: rows as u32,
+            cols: cols as u32,
+        })),
+    })
+    .await
+    .ok();
+    // Pump local stdin → input frames; a clean stdin EOF (or pipe close) sends
+    // `close`, ending the session on the agent. (This task is abandoned when the
+    // session ends; the caller's `process::exit` reaps its blocking read.)
+    let stdin_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let frame = ShellClientMsg {
+                        msg: Some(ClientMsg::Input(buf[..n].to_vec())),
+                    };
+                    if stdin_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = stdin_tx
+            .send(ShellClientMsg {
+                msg: Some(ClientMsg::Close(true)),
+            })
+            .await;
+    });
+    drop(tx); // only the stdin task holds a sender now
+
+    let req = authed(tokio_stream::wrappers::ReceiverStream::new(rx), &token)?;
+    let mut resp = client.shell(req).await?.into_inner();
+    let mut stdout = std::io::stdout();
+    while let Some(msg) = resp.message().await? {
+        match msg.msg {
+            Some(ServerMsg::Output(data)) => {
+                stdout.write_all(&data)?;
+                stdout.flush()?;
+            }
+            Some(ServerMsg::Closed(_)) => break, // the remote shell exited
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Query the local terminal size (rows, cols) via `TIOCGWINSZ` on stdout, or `None`
+/// if stdout is not a terminal.
+fn terminal_size() -> Option<(u16, u16)> {
+    // SAFETY: `winsize` is a plain-old-data struct; zeroing it is valid.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid fd (stdout) and a pointer to a live `winsize`.
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        Some((ws.ws_row, ws.ws_col))
+    } else {
+        None
+    }
+}
+
+/// Puts the local terminal (stdin) into raw mode for its lifetime, restoring the
+/// original settings on drop — so a normal exit, an error, or a panic all leave the
+/// terminal usable. A no-op when stdin is not a TTY (piped/redirected input).
+struct RawMode {
+    original: Option<nix::sys::termios::Termios>,
+}
+
+impl RawMode {
+    fn enable() -> Self {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+        let stdin = std::io::stdin();
+        // `tcgetattr` fails when stdin is not a terminal — then run line-buffered.
+        let Ok(original) = tcgetattr(&stdin) else {
+            return Self { original: None };
+        };
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        if tcsetattr(&stdin, SetArg::TCSANOW, &raw).is_err() {
+            return Self { original: None };
+        }
+        Self {
+            original: Some(original),
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if let Some(original) = &self.original {
+            use nix::sys::termios::{SetArg, tcsetattr};
+            let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, original);
+        }
+    }
 }
 
 /// Lowercase-hex encode bytes.
