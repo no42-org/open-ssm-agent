@@ -23,6 +23,7 @@ mod exec;
 mod jobstore;
 mod pty;
 mod session;
+mod shell_stream;
 
 #[derive(Parser)]
 #[command(

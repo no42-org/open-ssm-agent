@@ -13,6 +13,7 @@
 //! authenticated session (#20), and runs sealed `Dispatch`es as spawned jobs that
 //! stream sealed results back (Epic 3).
 
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use osa_core::allowlist::LocalAllowlist;
-use osa_proto::v1::{Dispatch, Envelope};
+use osa_proto::v1::{ActionDescriptor, Dispatch, Envelope, ShellParams};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
@@ -28,6 +29,17 @@ use tokio::time::sleep;
 use crate::dispatch::{self, JobChannel};
 use crate::jobstore::JobStore;
 use crate::session::{AgentIdentity, Established, Handshaking};
+use crate::shell_stream::ShellStream;
+
+/// Default terminal size when a `ShellParams` omits (or zeroes) a dimension.
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_COLS: u16 = 80;
+/// Max byte length of a shell stream_id (the dispatch `job_id`); mirrors the exec
+/// path's `job_id` bound.
+const MAX_STREAM_ID_LEN: usize = 256;
+/// Cap on distinct shells opened within one session, bounding the reuse-guard set
+/// (a compromised coordinator cannot grow it without bound).
+const MAX_SHELLS_PER_SESSION: usize = 4096;
 
 /// Bound on undelivered sealed job-result bytes queued for the publisher; the job
 /// runner backpressures on `send().await` rather than dropping output.
@@ -161,6 +173,21 @@ pub async fn run(
             results_rx,
             topics.result_up.clone(),
         ));
+        // A shell stream (Epic 4) publishes sealed PTY output on its own topic —
+        // a separate publisher so shell output and job results never head-of-line
+        // block each other. At most one interactive shell is active per connection;
+        // it is dropped (and its child reaped) when this connection ends.
+        let (stream_up_tx, stream_up_rx) = mpsc::channel::<Vec<u8>>(RESULT_QUEUE);
+        tokio::spawn(publish_results(
+            client.clone(),
+            stream_up_rx,
+            topics.stream_up.clone(),
+        ));
+        let mut active_stream: Option<ShellStream> = None;
+        // Stream_ids used for a shell this session — the reuse guard against
+        // catastrophic AEAD nonce reuse (a recycled id re-derives the subkey with
+        // seq from 0). Reset per connection: a new session re-derives all subkeys.
+        let mut used_stream_ids: HashSet<String> = HashSet::new();
 
         let mut connected_at: Option<Instant> = None;
         loop {
@@ -189,9 +216,12 @@ pub async fn run(
                             &inflight,
                             &job_permits,
                             &results_tx,
+                            &stream_up_tx,
                             &topics,
                             &mut handshaking,
                             &mut session,
+                            &mut active_stream,
+                            &mut used_stream_ids,
                         );
                     }
                     Ok(_) => {}
@@ -207,6 +237,10 @@ pub async fn run(
                 }
             }
         }
+
+        // The session is gone: tear down any live shell now (reaping its PTY)
+        // rather than letting it linger through the backoff sleep below.
+        drop(active_stream.take());
 
         // Reset backoff only after a *stable* session, so a connection that flaps
         // right after ConnAck still backs off instead of reconnecting in a storm.
@@ -243,7 +277,7 @@ fn publish_heartbeat(client: &AsyncClient, topic: &str) {
     }
 }
 
-/// The per-host session topics (#20), computed once per connection.
+/// The per-host session topics (#20, Epic 3/4), computed once per connection.
 struct SessionTopics {
     hs_up: String,
     hs_down: String,
@@ -251,6 +285,8 @@ struct SessionTopics {
     ctrl_down: String,
     dispatch_down: String,
     result_up: String,
+    stream_up: String,
+    stream_down: String,
 }
 
 impl SessionTopics {
@@ -262,6 +298,8 @@ impl SessionTopics {
             ctrl_down: osa_core::topics::ctrl_down(host_id),
             dispatch_down: osa_core::topics::dispatch_down(host_id),
             result_up: osa_core::topics::result_up(host_id),
+            stream_up: osa_core::topics::stream_up(host_id),
+            stream_down: osa_core::topics::stream_down(host_id),
         }
     }
 }
@@ -286,6 +324,10 @@ fn begin_handshake(
     }
     if let Err(e) = client.try_subscribe(topics.dispatch_down.clone(), QoS::AtLeastOnce) {
         tracing::warn!(error = %e, "control channel: subscribing dispatch downlink failed");
+        return None;
+    }
+    if let Err(e) = client.try_subscribe(topics.stream_down.clone(), QoS::AtLeastOnce) {
+        tracing::warn!(error = %e, "control channel: subscribing stream downlink failed");
         return None;
     }
     let (hs, hello) = match crate::session::start_handshake(id) {
@@ -317,9 +359,12 @@ fn on_publish(
     inflight: &dispatch::InFlight,
     job_permits: &Arc<Semaphore>,
     results: &mpsc::Sender<Vec<u8>>,
+    stream_up: &mpsc::Sender<Vec<u8>>,
     topics: &SessionTopics,
     handshaking: &mut Option<Handshaking>,
     session: &mut Option<Established>,
+    active_stream: &mut Option<ShellStream>,
+    used_stream_ids: &mut HashSet<String>,
 ) {
     if topic == topics.hs_down {
         let Some(hs) = handshaking.take() else {
@@ -357,16 +402,49 @@ fn on_publish(
             tracing::warn!("control channel: dispatch before a session — ignoring");
             return;
         };
-        handle_dispatch(
-            est,
-            id,
-            backstop,
-            jobs,
-            inflight,
-            job_permits,
-            results,
-            payload,
-        );
+        // One replay-guarded open on the control session, then route by capability.
+        let Some(dispatch) = open_dispatch(est, payload) else {
+            return;
+        };
+        if dispatch.kind == crate::pty::KIND {
+            handle_shell_open(
+                est,
+                id,
+                backstop,
+                stream_up,
+                active_stream,
+                used_stream_ids,
+                dispatch,
+            );
+        } else {
+            handle_job(
+                est,
+                id,
+                backstop,
+                jobs,
+                inflight,
+                job_permits,
+                results,
+                dispatch,
+            );
+        }
+    } else if topic == topics.stream_down {
+        let Some(stream) = active_stream.as_mut() else {
+            return; // no shell open — a late or stray stream frame
+        };
+        let env: Envelope = match osa_core::wire::decode(payload) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "control channel: malformed stream frame — dropping");
+                return;
+            }
+        };
+        // `route_downlink` returns false on the operator's terminal eof frame; the
+        // stream is then dropped, reaping its PTY child.
+        if !stream.route_downlink(&env) {
+            tracing::info!("control channel: shell stream closed by operator");
+            *active_stream = None;
+        }
     }
 }
 
@@ -386,12 +464,40 @@ async fn publish_results(client: AsyncClient, mut rx: mpsc::Receiver<Vec<u8>>, t
     }
 }
 
-/// Open a sealed `Dispatch` against the live session and spawn it as a job that
-/// streams sealed results. Rejects a replayed/stale downlink `seq` (anti
-/// double-execution) before opening. Spawned so a long command never blocks the
+/// Decode + authenticate + replay-guard a sealed `Dispatch` on the control
+/// session: decode the envelope, `open_downlink` (which authenticates *before*
+/// advancing the guard, so a forgery can neither act nor poison the high-water
+/// mark), and decode the `Dispatch`. `None` (logged) on any failure.
+fn open_dispatch(est: &mut Established, payload: &[u8]) -> Option<Dispatch> {
+    let env: Envelope = match osa_core::wire::decode(payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "control channel: malformed dispatch envelope — dropping");
+            return None;
+        }
+    };
+    let Some(plaintext) = est.open_downlink(&env) else {
+        tracing::warn!(
+            seq = env.seq,
+            "control channel: dispatch did not open or was replayed — dropping"
+        );
+        return None;
+    };
+    match osa_core::wire::decode(&plaintext) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::warn!(error = %e, "control channel: undecodable dispatch — dropping");
+            None
+        }
+    }
+}
+
+/// Run a `kind = "exec"` dispatch as a spawned job that streams sealed results.
+/// Sheds (does not queue) at the concurrency cap so a compromised coordinator
+/// cannot fork-bomb the host (AD-20); spawned so a long command never blocks the
 /// event loop.
 #[allow(clippy::too_many_arguments)]
-fn handle_dispatch(
+fn handle_job(
     est: &mut Established,
     id: &AgentIdentity,
     backstop: &Arc<LocalAllowlist>,
@@ -399,34 +505,8 @@ fn handle_dispatch(
     inflight: &dispatch::InFlight,
     job_permits: &Arc<Semaphore>,
     results: &mpsc::Sender<Vec<u8>>,
-    payload: &[u8],
+    dispatch: Dispatch,
 ) {
-    let env: Envelope = match osa_core::wire::decode(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "control channel: malformed dispatch envelope — dropping");
-            return;
-        }
-    };
-    // Authenticate first, then enforce the replay guard (open_downlink): a forged
-    // envelope can neither be acted on nor poison the replay high-water mark.
-    let Some(plaintext) = est.open_downlink(&env) else {
-        tracing::warn!(
-            seq = env.seq,
-            "control channel: dispatch did not open or was replayed — dropping"
-        );
-        return;
-    };
-    let dispatch: Dispatch = match osa_core::wire::decode(&plaintext) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = %e, "control channel: undecodable dispatch — dropping");
-            return;
-        }
-    };
-    // Bound concurrent jobs/children. Shed (don't queue) at capacity so a
-    // compromised coordinator cannot fork-bomb the host; a legitimate operator
-    // sees a timeout and can retry.
     let Ok(permit) = Arc::clone(job_permits).try_acquire_owned() else {
         tracing::warn!(job_id = %dispatch.job_id, "control channel: at job capacity — shedding dispatch");
         return;
@@ -446,6 +526,84 @@ fn handle_dispatch(
         let _permit = permit; // held for the job's life; frees a slot on completion
         dispatch::run_job(dispatch, backstop, jobs, inflight, channel).await;
     });
+}
+
+/// Open an interactive shell for a `kind = "shell"` dispatch (Epic 4): enforce the
+/// host backstop (kind + run_as, AD-20), size the PTY from `ShellParams`, and start
+/// the sealed stream keyed by the dispatch `job_id` (the stream_id). A new shell
+/// replaces any existing one, whose PTY is reaped when the old `ShellStream` drops.
+#[allow(clippy::too_many_arguments)]
+fn handle_shell_open(
+    est: &mut Established,
+    id: &AgentIdentity,
+    backstop: &Arc<LocalAllowlist>,
+    stream_up: &mpsc::Sender<Vec<u8>>,
+    active_stream: &mut Option<ShellStream>,
+    used_stream_ids: &mut HashSet<String>,
+    dispatch: Dispatch,
+) {
+    // The `job_id` is the stream_id keying the per-stream AEAD subkey — it MUST be
+    // unique per session (reuse re-derives the subkey with seq from 0: catastrophic
+    // nonce reuse). The coordinator mints fresh ids, but the agent does not trust it
+    // (AD-20): reject an empty/over-long id, and any id already used this session.
+    if dispatch.job_id.is_empty() || dispatch.job_id.len() > MAX_STREAM_ID_LEN {
+        tracing::warn!("control channel: shell refused — empty or over-long stream_id");
+        return;
+    }
+    if used_stream_ids.contains(&dispatch.job_id) {
+        tracing::warn!(job_id = %dispatch.job_id, "control channel: shell refused — stream_id reused this session (nonce-reuse guard)");
+        return;
+    }
+    if used_stream_ids.len() >= MAX_SHELLS_PER_SESSION {
+        tracing::warn!("control channel: shell refused — too many shells this session");
+        return;
+    }
+    // The host backstop is the floor even for an interactive shell: refuse a kind or
+    // run_as this host does not permit, independently of the coordinator (AD-20).
+    let action = ActionDescriptor {
+        kind: dispatch.kind.clone(),
+        target: String::new(),
+        run_as: dispatch.run_as.clone(),
+        params_hash: Vec::new(),
+    };
+    if let Err(denial) = backstop.permits(&action) {
+        tracing::warn!(%denial, job_id = %dispatch.job_id, "control channel: shell refused by host backstop");
+        return;
+    }
+    let params: ShellParams = osa_core::wire::decode(&dispatch.params).unwrap_or_default();
+    let rows = clamp_dim(params.rows, DEFAULT_ROWS);
+    let cols = clamp_dim(params.cols, DEFAULT_COLS);
+    match ShellStream::open(
+        est.keys().as_ref(),
+        &dispatch.job_id,
+        &dispatch.run_as,
+        rows,
+        cols,
+        &id.host_id,
+        est.sid(),
+        stream_up.clone(),
+    ) {
+        Ok(stream) => {
+            tracing::info!(job_id = %dispatch.job_id, run_as = %dispatch.run_as, "control channel: interactive shell opened");
+            // Reserve the id only once the subkey is actually in use (a failed open
+            // sealed nothing, so its id stays reusable).
+            used_stream_ids.insert(dispatch.job_id);
+            *active_stream = Some(stream); // replaces + reaps any prior shell
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, job_id = %dispatch.job_id, "control channel: shell open failed")
+        }
+    }
+}
+
+/// Clamp a `ShellParams` dimension into `1..=u16::MAX`, defaulting a zero (unset)
+/// value to `default`.
+fn clamp_dim(v: u32, default: u16) -> u16 {
+    if v == 0 {
+        default
+    } else {
+        v.min(u16::MAX as u32) as u16
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +628,16 @@ mod tests {
         let a = backoff(8, stable_seed("host-a"));
         let b = backoff(8, stable_seed("host-b"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn clamp_dim_defaults_zero_and_bounds_to_u16() {
+        assert_eq!(clamp_dim(0, 24), 24, "unset (0) uses the default");
+        assert_eq!(clamp_dim(80, 24), 80, "a normal value passes through");
+        assert_eq!(
+            clamp_dim(1_000_000, 24),
+            u16::MAX,
+            "a hostile huge value clamps to u16::MAX"
+        );
     }
 }
