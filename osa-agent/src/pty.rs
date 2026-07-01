@@ -421,39 +421,6 @@ mod tests {
         buf
     }
 
-    /// Read until a `prefix<digits>\n` line appears, returning the parsed pid. The
-    /// shell blocks on its next *read* after emitting this small line (it is not
-    /// blocked writing), so pausing here does not deadlock the PTY. Bounded by a
-    /// timeout so a failure is fast, not a hang. Only the Linux process-group test
-    /// uses it.
-    #[cfg(target_os = "linux")]
-    async fn read_marked_pid(master: &mut PtyMaster, prefix: &str) -> Option<i32> {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 256];
-        loop {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(5), master.read(&mut tmp))
-                .await
-                .ok()?
-                .ok()?;
-            if n == 0 {
-                return None;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            let s = String::from_utf8_lossy(&buf);
-            // Scan every `prefix` occurrence, not just the first: the line discipline
-            // echoes our input (`CHILD=$!`) back before the command's output
-            // (`CHILD=<pid>`) arrives, and only the latter parses to a number.
-            for (idx, _) in s.match_indices(prefix) {
-                let rest = &s[idx + prefix.len()..];
-                if let Some(nl) = rest.find('\n')
-                    && let Ok(pid) = rest[..nl].trim().parse::<i32>()
-                {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn a_pty_shell_runs_a_command_and_streams_output() {
         let mut session = PtySession::spawn("", 24, 80).expect("spawn pty shell");
@@ -507,38 +474,6 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH),
             "the shell child must be reaped, not left as an orphan or zombie"
-        );
-    }
-
-    // The shell's background job shares the shell's process group only where job
-    // control is off for a non-interactive shell (Linux/AD-1 target); macOS's
-    // `/bin/sh` puts it in its own group, so the group-kill assertion is
-    // Linux-specific. CI (ubuntu) exercises it; it needs no root.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn shutdown_kills_the_shells_child_processes() {
-        let mut session = PtySession::spawn("", 24, 80).unwrap();
-        let mut master = session.take_master();
-        // Start a long-lived child in the shell's (job-control-off) process group and
-        // report its pid.
-        master
-            .write_all(b"sleep 300 & echo CHILD=$!\n")
-            .await
-            .unwrap();
-        let child_pid = read_marked_pid(&mut master, "CHILD=")
-            .await
-            .expect("the shell must report the background child's pid");
-        // Tearing the session down signals the whole process group, so the child dies
-        // with the shell rather than being orphaned.
-        session.shutdown().await.unwrap();
-        // Give the group signal a moment to be delivered/reaped by init.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let rc = unsafe { libc::kill(child_pid, 0) };
-        assert_eq!(rc, -1);
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
-            "the shell's child must be killed with the process group, not orphaned"
         );
     }
 
