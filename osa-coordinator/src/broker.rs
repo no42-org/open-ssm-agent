@@ -45,6 +45,7 @@ use tokio::sync::mpsc::{self, Sender, channel, error::TrySendError};
 use uuid::Uuid;
 
 use crate::ca::EmbeddedCa;
+use crate::epoch::Epochs;
 use crate::revocation::Revocations;
 use crate::session::SessionStore;
 
@@ -199,6 +200,7 @@ pub fn spawn(
     cert_dir: &Path,
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
+    epochs: Arc<dyn Epochs>,
     commands: mpsc::Receiver<BridgeCommand>,
 ) -> anyhow::Result<()> {
     let path = |name: &str| cert_dir.join(name).to_string_lossy().into_owned();
@@ -276,7 +278,14 @@ pub fn spawn(
         .name("osa-bridge-recv".to_string())
         .spawn(move || forward_events(link_rx, evt_tx))
         .context("spawning bridge receive thread")?;
-    tokio::spawn(run_bridge(evt_rx, commands, link_tx, ca, revocations));
+    tokio::spawn(run_bridge(
+        evt_rx,
+        commands,
+        link_tx,
+        ca,
+        revocations,
+        epochs,
+    ));
     Ok(())
 }
 
@@ -331,17 +340,12 @@ async fn run_bridge(
     mut link_tx: LinkTx,
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
+    epochs: Arc<dyn Epochs>,
 ) {
     let mut sessions = SessionStore::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut pending: PendingJobs = HashMap::new();
     let mut shells: ActiveShells = HashMap::new();
-    // Highest accepted session epoch per host (4.3, anti-resurrection). In-memory
-    // per coordinator instance in 4.3a; a durable store for failover lands in 4.3b.
-    // Intentionally uncapped, unlike the sibling maps: evicting a host's high-water
-    // would reopen its resurrection window, so the durable store (4.3b) — not an
-    // in-memory bound — is the right home for this. Bounded by enrolled hosts (#16).
-    let mut epochs: HashMap<HostId, u64> = HashMap::new();
     let mut commands_open = true;
     let mut sweep = tokio::time::interval(PENDING_SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -358,7 +362,7 @@ async fn run_bridge(
                     }
                 } else if let Some(tenant) = tenant_from_hs_up(&topic) {
                     if let Some(host) = handle_client_hello(
-                        tenant, &payload, &ca, revocations.as_ref(), &mut sessions, &mut epochs, &mut link_tx,
+                        tenant, &payload, &ca, revocations.as_ref(), epochs.as_ref(), &mut sessions, &mut link_tx,
                     )
                     .await
                     {
@@ -396,8 +400,8 @@ async fn handle_client_hello(
     payload: &[u8],
     ca: &EmbeddedCa,
     revocations: &dyn Revocations,
+    epochs: &dyn Epochs,
     sessions: &mut SessionStore,
-    epochs: &mut HashMap<HostId, u64>,
     link_tx: &mut LinkTx,
 ) -> Option<HostId> {
     let hello: ClientHello = match osa_core::wire::decode(payload) {
@@ -474,16 +478,23 @@ async fn handle_client_hello(
         }
     };
     // Anti-resurrection (4.3): now that the handshake authenticated the epoch (the
-    // agent signed it), reject a session-open whose epoch is not strictly greater
-    // than the highest accepted for this host. A replayed or stale ClientHello —
-    // even one captured by the untrusted broker and re-sent after the session ended
-    // — cannot displace or resurrect a session.
-    if epochs
-        .get(&verified.host_id)
-        .is_some_and(|&h| hello.epoch <= h)
-    {
-        tracing::warn!(host = %host_str, epoch = hello.epoch, "rejecting ClientHello: stale/replayed session epoch");
-        return None;
+    // agent signed it), atomically admit it iff it is strictly greater than this
+    // host's durable high-water, recording it in the same step. A replayed or stale
+    // ClientHello — even one captured by the untrusted broker and re-sent after the
+    // session ended — is rejected, and the high-water is durable (4.3b) so the guard
+    // holds across a coordinator restart or failover. Admit runs BEFORE reserving the
+    // session, so a rejected replay never touches session state; fail closed on a
+    // store error (no session rather than a possibly-unguarded one).
+    match epochs.admit(verified.host_id, hello.epoch).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(host = %host_str, epoch = hello.epoch, "rejecting ClientHello: stale/replayed session epoch");
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, host = %host_str, "epoch admission failed — refusing session");
+            return None;
+        }
     }
     // Reserve (store) the session BEFORE emitting anything the agent treats as
     // established, so a store-at-capacity refusal cannot leave the agent with a
@@ -492,9 +503,6 @@ async fn handle_client_hello(
         tracing::warn!(host = %host_str, "session store at capacity — refusing session");
         return None;
     }
-    // Record the accepted epoch as this host's new high-water mark (in-memory in
-    // 4.3a; a durable store for coordinator failover lands in 4.3b).
-    epochs.insert(verified.host_id, hello.epoch);
     // ServerHello (cleartext, signature-authenticated) on the handshake downlink.
     let server_hello = ServerHello {
         sid: hello.sid.clone(),
@@ -1098,6 +1106,7 @@ mod tests {
             dir.path(),
             Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap()),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -1178,6 +1187,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -1383,6 +1393,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             revocations.clone(),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -1466,6 +1477,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             revocations.clone(),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -1503,6 +1515,100 @@ mod tests {
         assert!(
             accepted("sid-c", 3).await,
             "a ClientHello advancing the epoch must be accepted"
+        );
+    }
+
+    /// The anti-resurrection high-water is durable: after a coordinator "restart"
+    /// (a fresh bridge + a fresh `PgEpochs` over the SAME Postgres) a replayed old
+    /// ClientHello is still rejected — proving 4.3b closes the failover window that
+    /// 4.3a's in-memory map left open. Needs Docker (testcontainers).
+    #[tokio::test]
+    async fn a_persisted_epoch_high_water_survives_a_coordinator_restart() {
+        use crate::epoch::PgEpochs;
+        use crate::revocation::RevocationRegistry;
+        use testcontainers_modules::postgres::Postgres;
+        use testcontainers_modules::testcontainers::ImageExt;
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let node = Postgres::default()
+            .with_tag("17-alpine")
+            .start()
+            .await
+            .unwrap();
+        let db_port = node.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{db_port}/postgres");
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let host = HostId::new();
+        let host_str = host.0.to_string();
+        let (cert, key) = enroll_host(&ca, host).await;
+
+        // Stand up a bridge instance (a "coordinator") on a fresh port, with its own
+        // FRESH PgEpochs over the shared pool — the second call models a restart.
+        let boot = |port: u16| {
+            let ca = ca.clone();
+            let pool = pool.clone();
+            async move {
+                let server = ca.issue_server_cert(&["localhost"]).unwrap();
+                let dir = tempfile::TempDir::new().unwrap();
+                std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+                std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+                std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+                let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+                spawn(
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    dir.path(),
+                    ca.clone(),
+                    Arc::new(RevocationRegistry::new()),
+                    Arc::new(PgEpochs::new(pool)),
+                    cmd_rx,
+                )
+                .unwrap();
+                tokio::time::sleep(StdDuration::from_millis(400)).await;
+                // Hold cmd_tx + cert dir for the bridge's life.
+                (dir, _cmd_tx)
+            }
+        };
+
+        let hello = |sid: &str, epoch: u64, port: u16| {
+            let payload = client_hello_bytes(sid, epoch, &cert, &key);
+            server_hello_within(
+                &ca,
+                &cert,
+                &key,
+                &host_str,
+                port,
+                payload,
+                StdDuration::from_secs(5),
+            )
+        };
+
+        // Coordinator #1 accepts epoch 5, durably recording the high-water.
+        let port1 = free_port();
+        let _keep1 = boot(port1).await;
+        assert!(
+            hello("sid-1", 5, port1).await,
+            "the first coordinator must accept and persist epoch 5"
+        );
+
+        // Coordinator #2 is a restart: a brand-new bridge + a brand-new PgEpochs over
+        // the same database, with no in-memory carry-over.
+        let port2 = free_port();
+        let _keep2 = boot(port2).await;
+        assert!(
+            !hello("sid-replay", 5, port2).await,
+            "after restart, replaying epoch 5 must still be rejected (durable high-water)"
+        );
+        assert!(
+            !hello("sid-older", 3, port2).await,
+            "an even older epoch is rejected too"
+        );
+        assert!(
+            hello("sid-fresh", 6, port2).await,
+            "the host still advances normally past the persisted high-water"
         );
     }
 
@@ -1856,6 +1962,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -2140,6 +2247,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -2254,6 +2362,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();
@@ -2380,6 +2489,7 @@ mod tests {
             dir.path(),
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
+            Arc::new(crate::epoch::EpochRegistry::new()),
             cmd_rx,
         )
         .unwrap();

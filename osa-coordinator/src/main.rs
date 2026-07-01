@@ -31,6 +31,7 @@ mod auth;
 mod broker;
 mod ca;
 mod db;
+mod epoch;
 mod jwks;
 mod policy;
 mod revocation;
@@ -168,20 +169,21 @@ async fn main() -> anyhow::Result<()> {
         None => ca::EmbeddedCa::new(HOST_CERT_TTL)?,
     });
 
-    let (tokens, revocations, audit): (
-        Arc<dyn token::JoinTokens>,
-        Arc<dyn revocation::Revocations>,
-        Arc<dyn osa_core::ports::AuditLog>,
-    ) = match &pool {
+    let (tokens, revocations, audit, epochs) = match &pool {
         Some(pool) => (
-            Arc::new(token::PgJoinTokens::new(pool.clone(), MAX_TOKEN_TTL)),
-            Arc::new(revocation::PgRevocations::new(pool.clone())),
-            Arc::new(audit_log::PgAuditLog::new(pool.clone())),
+            Arc::new(token::PgJoinTokens::new(pool.clone(), MAX_TOKEN_TTL))
+                as Arc<dyn token::JoinTokens>,
+            Arc::new(revocation::PgRevocations::new(pool.clone()))
+                as Arc<dyn revocation::Revocations>,
+            Arc::new(audit_log::PgAuditLog::new(pool.clone()))
+                as Arc<dyn osa_core::ports::AuditLog>,
+            Arc::new(epoch::PgEpochs::new(pool.clone())) as Arc<dyn epoch::Epochs>,
         ),
         None => (
-            Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL)),
-            Arc::new(revocation::RevocationRegistry::new()),
-            Arc::new(audit_log::MemoryAuditLog::new()),
+            Arc::new(token::JoinTokenRegistry::new(MAX_TOKEN_TTL)) as Arc<dyn token::JoinTokens>,
+            Arc::new(revocation::RevocationRegistry::new()) as Arc<dyn revocation::Revocations>,
+            Arc::new(audit_log::MemoryAuditLog::new()) as Arc<dyn osa_core::ports::AuditLog>,
+            Arc::new(epoch::EpochRegistry::new()) as Arc<dyn epoch::Epochs>,
         ),
     };
 
@@ -210,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         cert_dir.path(),
         ca.clone(),
         revocations.clone(),
+        epochs,
         bridge_rx,
     )?;
     wait_until_listening(mqtt_addr).await?;
