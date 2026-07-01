@@ -138,6 +138,7 @@ mod tests {
             client_eph: vec![1; 32],
             cert_der: vec![2, 3, 4],
             sig: vec![5; 64],
+            epoch: 1,
         };
         let back: ClientHello = decode(&encode(&hello)).unwrap();
         assert_eq!(back, hello);

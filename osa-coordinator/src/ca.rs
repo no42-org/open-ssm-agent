@@ -193,6 +193,7 @@ impl EmbeddedCa {
     pub fn respond_handshake(
         &self,
         sid: &[u8],
+        epoch: u64,
         client_eph: &[u8; 32],
         client_sig: &[u8],
         public_key_sec1: &[u8],
@@ -200,6 +201,7 @@ impl EmbeddedCa {
     ) -> Result<osa_core::handshake::ServerResponse, PortError> {
         osa_core::handshake::respond(
             sid,
+            epoch,
             client_eph,
             client_sig,
             public_key_sec1,
@@ -694,13 +696,14 @@ mod tests {
         let cert_der = ca.issue(host, &csr_with_key(&key)).unwrap();
         let sid = b"session-1";
 
-        let (initiator, hello) = Initiator::start(sid, &cert_der, &key.serialize_pem()).unwrap();
+        let (initiator, hello) = Initiator::start(sid, 1, &cert_der, &key.serialize_pem()).unwrap();
         let client_eph: [u8; 32] = hello.client_eph;
 
         let verified = ca.verify_host_cert(&cert_der).unwrap();
         let resp = ca
             .respond_handshake(
                 sid,
+                1,
                 &client_eph,
                 &hello.sig,
                 &verified.public_key_sec1,

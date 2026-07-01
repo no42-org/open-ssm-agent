@@ -202,8 +202,14 @@ pub async fn run(
                         ever_connected = true;
                         tracing::info!(%host_id, "control channel: connected");
                         publish_heartbeat(&client, &heartbeat_topic);
-                        // Open an authenticated session as soon as we connect (#20).
-                        handshaking = begin_handshake(&client, &agent_id, &topics);
+                        // Open an authenticated session as soon as we connect (#20),
+                        // stamping it with a fresh monotonic epoch (4.3).
+                        match crate::session::next_epoch(state_dir) {
+                            Ok(epoch) => {
+                                handshaking = begin_handshake(&client, &agent_id, epoch, &topics)
+                            }
+                            Err(e) => tracing::error!(error = %e, "control channel: cannot advance session epoch — not opening a session"),
+                        }
                     }
                     Ok(Event::Incoming(Packet::Publish(p))) => {
                         on_publish(
@@ -312,6 +318,7 @@ impl SessionTopics {
 fn begin_handshake(
     client: &AsyncClient,
     id: &AgentIdentity,
+    epoch: u64,
     topics: &SessionTopics,
 ) -> Option<Handshaking> {
     if let Err(e) = client.try_subscribe(topics.hs_down.clone(), QoS::AtLeastOnce) {
@@ -330,7 +337,7 @@ fn begin_handshake(
         tracing::warn!(error = %e, "control channel: subscribing stream downlink failed");
         return None;
     }
-    let (hs, hello) = match crate::session::start_handshake(id) {
+    let (hs, hello) = match crate::session::start_handshake(id, epoch) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "control channel: building ClientHello failed");
