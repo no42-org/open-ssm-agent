@@ -64,11 +64,16 @@ fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(field);
 }
 
-/// What the agent signs in `ClientHello`: ctx ‖ len(sid)‖sid ‖ len(eph)‖eph.
-pub fn client_transcript(sid: &[u8], client_eph: &[u8; 32]) -> Vec<u8> {
-    let mut t = Vec::with_capacity(CLIENT_CTX.len() + sid.len() + 64);
+/// What the agent signs in `ClientHello`: ctx ‖ len(sid)‖sid ‖ epoch ‖ len(eph)‖eph.
+/// The monotonic session `epoch` (4.3, reconnect-safe) is folded into the SIGNED
+/// transcript, so the untrusted broker cannot forge or downgrade it: the
+/// coordinator rejects a session-open whose epoch is not strictly greater than the
+/// highest it has accepted for that host (anti-resurrection).
+pub fn client_transcript(sid: &[u8], epoch: u64, client_eph: &[u8; 32]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(CLIENT_CTX.len() + sid.len() + 72);
     t.extend_from_slice(CLIENT_CTX);
     push_field(&mut t, sid);
+    t.extend_from_slice(&epoch.to_be_bytes());
     push_field(&mut t, client_eph);
     t
 }
@@ -139,12 +144,13 @@ impl Initiator {
     /// key binding so it matches what the coordinator binds).
     pub fn start(
         sid: &[u8],
+        epoch: u64,
         cert_der: &[u8],
         signing_key_pem: &str,
     ) -> Result<(Self, ClientHello), HsError> {
         let eph = Handshake::new().map_err(|_| HsError::Rng)?;
         let client_eph = eph.public;
-        let sig = sign(signing_key_pem, &client_transcript(sid, &client_eph))?;
+        let sig = sign(signing_key_pem, &client_transcript(sid, epoch, &client_eph))?;
         Ok((
             Self {
                 eph,
@@ -188,6 +194,7 @@ pub struct ServerResponse {
 /// `ServerHello` with the CA key, and derives the session keys.
 pub fn respond(
     sid: &[u8],
+    epoch: u64,
     client_eph: &[u8; 32],
     client_sig: &[u8],
     agent_public_key_sec1: &[u8],
@@ -196,7 +203,7 @@ pub fn respond(
 ) -> Result<ServerResponse, HsError> {
     verify(
         agent_public_key_sec1,
-        &client_transcript(sid, client_eph),
+        &client_transcript(sid, epoch, client_eph),
         client_sig,
     )?;
     let eph = Handshake::new().map_err(|_| HsError::Rng)?;
@@ -221,6 +228,10 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey;
 
+    /// A session epoch for the tests (4.3); the exact value is immaterial to the
+    /// crypto, only that both sides use the same one.
+    const EPOCH: u64 = 1;
+
     /// A fixed ECDSA P-256 identity from a deterministic scalar:
     /// (PKCS#8 PEM private, SEC1 public-point bytes). Deterministic so the tests
     /// are reproducible while still exercising real ECDSA sign/verify.
@@ -242,10 +253,11 @@ mod tests {
         let sid = b"session-1";
 
         // Agent → ClientHello.
-        let (initiator, hello) = Initiator::start(sid, cert_der, &agent_key).unwrap();
+        let (initiator, hello) = Initiator::start(sid, EPOCH, cert_der, &agent_key).unwrap();
         // Coordinator (cert already verified) → ServerHello + its keys.
         let resp = respond(
             sid,
+            EPOCH,
             &hello.client_eph,
             &hello.sig,
             &agent_pub,
@@ -279,10 +291,11 @@ mod tests {
 
         // Signature made by the wrong key; verifying against the agent's real
         // public key must fail (a MITM cannot impersonate the agent).
-        let (_init, hello) = Initiator::start(sid, cert_der, &other_key).unwrap();
+        let (_init, hello) = Initiator::start(sid, EPOCH, cert_der, &other_key).unwrap();
         assert!(matches!(
             respond(
                 sid,
+                EPOCH,
                 &hello.client_eph,
                 &hello.sig,
                 &agent_pub,
@@ -293,11 +306,12 @@ mod tests {
         ));
 
         // Tampering the ephemeral after signing is likewise rejected.
-        let (_init, mut bad) = Initiator::start(sid, cert_der, &agent_key).unwrap();
+        let (_init, mut bad) = Initiator::start(sid, EPOCH, cert_der, &agent_key).unwrap();
         bad.client_eph[0] ^= 1;
         assert!(matches!(
             respond(
                 sid,
+                EPOCH,
                 &bad.client_eph,
                 &bad.sig,
                 &agent_pub,
@@ -316,10 +330,11 @@ mod tests {
         let cert_der = b"agent-cert-der";
         let sid = b"session-1";
 
-        let (initiator, hello) = Initiator::start(sid, cert_der, &agent_key).unwrap();
+        let (initiator, hello) = Initiator::start(sid, EPOCH, cert_der, &agent_key).unwrap();
         // A MITM signs the ServerHello with a non-CA key.
         let resp = respond(
             sid,
+            EPOCH,
             &hello.client_eph,
             &hello.sig,
             &agent_pub,
@@ -343,9 +358,9 @@ mod tests {
         // Sign an all-zero (low-order) ephemeral with a valid key, so only the
         // X25519 contributory check can catch it.
         let zero = [0u8; 32];
-        let sig = sign(&agent_key, &client_transcript(sid, &zero)).unwrap();
+        let sig = sign(&agent_key, &client_transcript(sid, EPOCH, &zero)).unwrap();
         assert!(matches!(
-            respond(sid, &zero, &sig, &agent_pub, cert_der, &ca_key),
+            respond(sid, EPOCH, &zero, &sig, &agent_pub, cert_der, &ca_key),
             Err(HsError::BadEphemeral(_))
         ));
     }
@@ -361,7 +376,7 @@ mod tests {
         let cert_der = b"agent-cert-der";
         let sid = b"session-1";
 
-        let (initiator, hello) = Initiator::start(sid, cert_der, &agent_key).unwrap();
+        let (initiator, hello) = Initiator::start(sid, EPOCH, cert_der, &agent_key).unwrap();
         let zero = [0u8; 32];
         let server_sig = sign(&ca_key, &server_transcript(sid, &hello.client_eph, &zero)).unwrap();
         assert!(matches!(
@@ -380,10 +395,12 @@ mod tests {
         let (ca_key, ca_pub) = identity_from(22);
         let sid = b"session-1";
 
-        let (initiator, hello) = Initiator::start(sid, b"agent-cert-der", &agent_key).unwrap();
+        let (initiator, hello) =
+            Initiator::start(sid, EPOCH, b"agent-cert-der", &agent_key).unwrap();
         // Coordinator binds a *different* cert than the agent did.
         let resp = respond(
             sid,
+            EPOCH,
             &hello.client_eph,
             &hello.sig,
             &agent_pub,
@@ -428,11 +445,48 @@ mod tests {
     fn transcripts_bind_their_fields() {
         // Different sids / ephemerals produce different transcripts (so a
         // signature can't be replayed across sessions).
-        let a = client_transcript(b"s1", &[1u8; 32]);
-        let b = client_transcript(b"s2", &[1u8; 32]);
-        let c = client_transcript(b"s1", &[2u8; 32]);
+        let a = client_transcript(b"s1", EPOCH, &[1u8; 32]);
+        let b = client_transcript(b"s2", EPOCH, &[1u8; 32]);
+        let c = client_transcript(b"s1", EPOCH, &[2u8; 32]);
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn the_epoch_is_authenticated_and_cannot_be_downgraded() {
+        // The agent signs its session epoch (4.3). A broker that rewrites the epoch
+        // to a lower value (to replay/resurrect an old session) fails the signature;
+        // only the epoch the agent actually signed verifies.
+        let (agent_key, agent_pub) = identity_from(11);
+        let (ca_key, _) = identity_from(22);
+        let cert_der = b"agent-cert-der";
+        let sid = b"session-1";
+        let (_init, hello) = Initiator::start(sid, 5, cert_der, &agent_key).unwrap();
+        assert!(matches!(
+            respond(
+                sid,
+                4,
+                &hello.client_eph,
+                &hello.sig,
+                &agent_pub,
+                cert_der,
+                &ca_key
+            ),
+            Err(HsError::BadSignature),
+        ));
+        assert!(
+            respond(
+                sid,
+                5,
+                &hello.client_eph,
+                &hello.sig,
+                &agent_pub,
+                cert_der,
+                &ca_key
+            )
+            .is_ok(),
+            "the epoch the agent signed verifies"
+        );
     }
 
     #[test]

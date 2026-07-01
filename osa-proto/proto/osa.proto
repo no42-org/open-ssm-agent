@@ -39,6 +39,10 @@ message ClientHello {
   bytes client_eph = 2; // 32-byte X25519 ephemeral public key
   bytes cert_der = 3;   // the agent's CA-signed cert (identity + chain to verify)
   bytes sig = 4;        // ECDSA P-256(agent key) over the client transcript
+  uint64 epoch = 5;     // monotonic session epoch (4.3): folded into the SIGNED
+                        // transcript. The coordinator rejects a session-open whose
+                        // epoch is not strictly greater than the highest it has
+                        // accepted for this host (reconnect-safe anti-resurrection).
 }
 
 // Coordinator's reply to a ClientHello (see ClientHello).

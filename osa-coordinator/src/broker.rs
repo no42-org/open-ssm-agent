@@ -336,6 +336,12 @@ async fn run_bridge(
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut pending: PendingJobs = HashMap::new();
     let mut shells: ActiveShells = HashMap::new();
+    // Highest accepted session epoch per host (4.3, anti-resurrection). In-memory
+    // per coordinator instance in 4.3a; a durable store for failover lands in 4.3b.
+    // Intentionally uncapped, unlike the sibling maps: evicting a host's high-water
+    // would reopen its resurrection window, so the durable store (4.3b) — not an
+    // in-memory bound — is the right home for this. Bounded by enrolled hosts (#16).
+    let mut epochs: HashMap<HostId, u64> = HashMap::new();
     let mut commands_open = true;
     let mut sweep = tokio::time::interval(PENDING_SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -352,7 +358,7 @@ async fn run_bridge(
                     }
                 } else if let Some(tenant) = tenant_from_hs_up(&topic) {
                     if let Some(host) = handle_client_hello(
-                        tenant, &payload, &ca, revocations.as_ref(), &mut sessions, &mut link_tx,
+                        tenant, &payload, &ca, revocations.as_ref(), &mut sessions, &mut epochs, &mut link_tx,
                     )
                     .await
                     {
@@ -391,6 +397,7 @@ async fn handle_client_hello(
     ca: &EmbeddedCa,
     revocations: &dyn Revocations,
     sessions: &mut SessionStore,
+    epochs: &mut HashMap<HostId, u64>,
     link_tx: &mut LinkTx,
 ) -> Option<HostId> {
     let hello: ClientHello = match osa_core::wire::decode(payload) {
@@ -454,6 +461,7 @@ async fn handle_client_hello(
     }
     let resp = match ca.respond_handshake(
         hello.sid.as_bytes(),
+        hello.epoch,
         &client_eph,
         &hello.sig,
         &verified.public_key_sec1,
@@ -465,6 +473,18 @@ async fn handle_client_hello(
             return None;
         }
     };
+    // Anti-resurrection (4.3): now that the handshake authenticated the epoch (the
+    // agent signed it), reject a session-open whose epoch is not strictly greater
+    // than the highest accepted for this host. A replayed or stale ClientHello —
+    // even one captured by the untrusted broker and re-sent after the session ended
+    // — cannot displace or resurrect a session.
+    if epochs
+        .get(&verified.host_id)
+        .is_some_and(|&h| hello.epoch <= h)
+    {
+        tracing::warn!(host = %host_str, epoch = hello.epoch, "rejecting ClientHello: stale/replayed session epoch");
+        return None;
+    }
     // Reserve (store) the session BEFORE emitting anything the agent treats as
     // established, so a store-at-capacity refusal cannot leave the agent with a
     // live session the coordinator never tracked.
@@ -472,6 +492,9 @@ async fn handle_client_hello(
         tracing::warn!(host = %host_str, "session store at capacity — refusing session");
         return None;
     }
+    // Record the accepted epoch as this host's new high-water mark (in-memory in
+    // 4.3a; a durable store for coordinator failover lands in 4.3b).
+    epochs.insert(verified.host_id, hello.epoch);
     // ServerHello (cleartext, signature-authenticated) on the handshake downlink.
     let server_hello = ServerHello {
         sid: hello.sid.clone(),
@@ -1190,7 +1213,7 @@ mod tests {
             root.public_key().subject_public_key.data.to_vec()
         };
         let (mut initiator, hello) =
-            Initiator::start(sid.as_bytes(), &cert_der, &host_key.serialize_pem())
+            Initiator::start(sid.as_bytes(), 1, &cert_der, &host_key.serialize_pem())
                 .map(|(i, h)| (Some(i), h))
                 .unwrap();
         let client_hello = ClientHello {
@@ -1198,6 +1221,7 @@ mod tests {
             client_eph: hello.client_eph.to_vec(),
             cert_der: cert_der.clone(),
             sig: hello.sig,
+            epoch: 1,
         };
 
         let mut keys: Option<SessionKeys> = None;
@@ -1270,16 +1294,17 @@ mod tests {
         (cert_der, key)
     }
 
-    /// Build an encoded `ClientHello` for `sid` with the host's identity.
-    fn client_hello_bytes(sid: &str, cert_der: &[u8], key: &rcgen::KeyPair) -> Vec<u8> {
+    /// Build an encoded `ClientHello` for `sid` at `epoch` with the host's identity.
+    fn client_hello_bytes(sid: &str, epoch: u64, cert_der: &[u8], key: &rcgen::KeyPair) -> Vec<u8> {
         use osa_core::handshake::Initiator;
         let (_init, hello) =
-            Initiator::start(sid.as_bytes(), cert_der, &key.serialize_pem()).unwrap();
+            Initiator::start(sid.as_bytes(), epoch, cert_der, &key.serialize_pem()).unwrap();
         osa_core::wire::encode(&osa_proto::v1::ClientHello {
             sid: sid.into(),
             client_eph: hello.client_eph.to_vec(),
             cert_der: cert_der.to_vec(),
             sig: hello.sig,
+            epoch,
         })
     }
 
@@ -1367,7 +1392,7 @@ mod tests {
         let revoked = HostId::new();
         let (rev_cert, rev_key) = enroll_host(&ca, revoked).await;
         revocations.revoke(revoked);
-        let rev_hello = client_hello_bytes("revoked-sid", &rev_cert, &rev_key);
+        let rev_hello = client_hello_bytes("revoked-sid", 1, &rev_cert, &rev_key);
         assert!(
             !server_hello_within(
                 &ca,
@@ -1401,7 +1426,7 @@ mod tests {
 
         // The bridge survived: a legitimate ClientHello from the same host now
         // completes (proving the loop kept serving after the bad inputs).
-        let good_hello = client_hello_bytes("live-sid", &live_cert, &live_key);
+        let good_hello = client_hello_bytes("live-sid", 1, &live_cert, &live_key);
         assert!(
             server_hello_within(
                 &ca,
@@ -1414,6 +1439,70 @@ mod tests {
             )
             .await,
             "the bridge must keep serving legitimate hosts after rejecting bad input"
+        );
+    }
+
+    /// A host's session epoch is anti-resurrection state: the coordinator accepts
+    /// a fresh ClientHello, rejects any later one whose epoch is ≤ the highest it
+    /// has already accepted for that host, and accepts one that advances past it.
+    /// This defeats a broker (or a captured old handshake) trying to resurrect a
+    /// stale session for a host that has since re-keyed and moved on (Story 4.3a).
+    #[tokio::test]
+    async fn the_coordinator_rejects_a_stale_epoch_session_open() {
+        use crate::revocation::RevocationRegistry;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let server = ca.issue_server_cert(&["localhost"]).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+        std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+        std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+        let port = free_port();
+        let revocations = Arc::new(RevocationRegistry::new());
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        spawn(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            dir.path(),
+            ca.clone(),
+            revocations.clone(),
+            cmd_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        // One enrolled host presents three ClientHellos in sequence, each with its
+        // own sid but at epochs 2, 1, 3 — the middle one is a replayed stale epoch.
+        let host = HostId::new();
+        let host_str = host.0.to_string();
+        let (cert, key) = enroll_host(&ca, host).await;
+        let accepted = |sid: &str, epoch: u64| {
+            let hello = client_hello_bytes(sid, epoch, &cert, &key);
+            server_hello_within(
+                &ca,
+                &cert,
+                &key,
+                &host_str,
+                port,
+                hello,
+                StdDuration::from_secs(5),
+            )
+        };
+
+        // epoch 2 is the first the coordinator sees for this host: accepted.
+        assert!(
+            accepted("sid-a", 2).await,
+            "the first ClientHello establishes the host's epoch and must be accepted"
+        );
+        // epoch 1 ≤ 2 (already accepted): a resurrection attempt, rejected.
+        assert!(
+            !accepted("sid-stale", 1).await,
+            "a ClientHello at an epoch ≤ the host's highest accepted must be rejected"
+        );
+        // epoch 3 advances past 2: the host legitimately moved on, accepted.
+        assert!(
+            accepted("sid-c", 3).await,
+            "a ClientHello advancing the epoch must be accepted"
         );
     }
 
@@ -1635,7 +1724,7 @@ mod tests {
         };
         let sid = "exec-itest";
         let (mut initiator, hello) =
-            Initiator::start(sid.as_bytes(), &cert_der, &key.serialize_pem())
+            Initiator::start(sid.as_bytes(), 1, &cert_der, &key.serialize_pem())
                 .map(|(i, h)| (Some(i), h))
                 .unwrap();
         let client_hello = ClientHello {
@@ -1643,6 +1732,7 @@ mod tests {
             client_eph: hello.client_eph.to_vec(),
             cert_der: cert_der.clone(),
             sig: hello.sig,
+            epoch: 1,
         };
 
         let mut keys: Option<SessionKeys> = None;
@@ -1876,7 +1966,7 @@ mod tests {
         };
         let sid = "shell-itest";
         let (mut initiator, hello) =
-            Initiator::start(sid.as_bytes(), &cert_der, &key.serialize_pem())
+            Initiator::start(sid.as_bytes(), 1, &cert_der, &key.serialize_pem())
                 .map(|(i, h)| (Some(i), h))
                 .unwrap();
         let client_hello = ClientHello {
@@ -1884,6 +1974,7 @@ mod tests {
             client_eph: hello.client_eph.to_vec(),
             cert_der: cert_der.clone(),
             sig: hello.sig,
+            epoch: 1,
         };
 
         let mut keys: Option<SessionKeys> = None; // control session keys

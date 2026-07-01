@@ -151,20 +151,67 @@ pub fn seal_uplink(
     wire::encode(&env)
 }
 
-/// Begin a session: mint a fresh `sid`, build and sign the `ClientHello`. Returns
-/// the in-flight state plus the encoded message to publish on the handshake
-/// uplink.
-pub fn start_handshake(id: &AgentIdentity) -> anyhow::Result<(Handshaking, Vec<u8>)> {
+/// Begin a session: mint a fresh `sid`, build and sign the `ClientHello` carrying
+/// this session's monotonic `epoch` (4.3). Returns the in-flight state plus the
+/// encoded message to publish on the handshake uplink.
+pub fn start_handshake(id: &AgentIdentity, epoch: u64) -> anyhow::Result<(Handshaking, Vec<u8>)> {
     let sid = uuid::Uuid::new_v4().to_string();
-    let (initiator, hello) = Initiator::start(sid.as_bytes(), &id.cert_der, &id.signing_key_pem)
-        .context("building ClientHello")?;
+    let (initiator, hello) =
+        Initiator::start(sid.as_bytes(), epoch, &id.cert_der, &id.signing_key_pem)
+            .context("building ClientHello")?;
     let msg = ClientHello {
         sid: sid.clone(),
         client_eph: hello.client_eph.to_vec(),
         cert_der: id.cert_der.clone(),
         sig: hello.sig,
+        epoch,
     };
     Ok((Handshaking { initiator, sid }, wire::encode(&msg)))
+}
+
+/// File under `state_dir` holding the agent's last-used session epoch (4.3).
+const EPOCH_FILE: &str = "session_epoch";
+
+/// Read, increment, and **durably** persist the agent's monotonic session epoch
+/// (4.3, reconnect-safe). The epoch advances on every session (per broker
+/// connection) and survives an agent restart, so a reconnect never reuses or
+/// regresses an epoch — that lets the coordinator reject a replayed old
+/// session-open (anti-resurrection). A missing file starts from 0 (fresh agent);
+/// a present-but-unparsable file fails **closed** — regressing to 0 would be the
+/// very resurrection the epoch exists to prevent, so the caller declines to open
+/// a session rather than silently reusing a stale epoch.
+pub fn next_epoch(state_dir: &Path) -> anyhow::Result<u64> {
+    let path = state_dir.join(EPOCH_FILE);
+    let current: u64 = match std::fs::read_to_string(&path) {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .context("session epoch file is corrupt; refusing to regress the epoch")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e).context("reading the session epoch"),
+    };
+    let next = current
+        .checked_add(1)
+        .context("session epoch overflow (u64)")?;
+    // Persist BEFORE returning: temp → fsync → rename → fsync(dir), so a crash
+    // mid-write can neither corrupt the epoch nor let it regress on restart.
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).context("creating epoch temp file")?;
+        f.write_all(next.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path).context("committing the epoch")?;
+    if let Some(dir) = path.parent() {
+        // fsync the directory so the rename itself is durable; propagate the error
+        // (matching JobStore::write_durably) rather than advertising crash-safety
+        // we didn't achieve — a lost dir-fsync could regress the epoch on restart.
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .context("fsyncing the state dir after committing the epoch")?;
+    }
+    Ok(next)
 }
 
 /// Finish on the coordinator's `ServerHello`: verify it against the pinned CA and
@@ -282,6 +329,7 @@ mod tests {
         let agent_pub = subject_pubkey_sec1(&id.cert_der).unwrap();
         osa_core::handshake::respond(
             hello.sid.as_bytes(),
+            hello.epoch,
             &client_eph,
             &hello.sig,
             &agent_pub,
@@ -292,13 +340,50 @@ mod tests {
     }
 
     #[test]
+    fn next_epoch_is_monotonic_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(next_epoch(dir.path()).unwrap(), 1, "starts from 1");
+        assert_eq!(next_epoch(dir.path()).unwrap(), 2);
+        assert_eq!(next_epoch(dir.path()).unwrap(), 3);
+        // A "restart" is just a fresh read of the persisted file — the epoch
+        // continues upward, never regressing (that would wedge the host out of new
+        // sessions the coordinator has already seen).
+        assert_eq!(
+            next_epoch(dir.path()).unwrap(),
+            4,
+            "persisted across restart"
+        );
+    }
+
+    #[test]
+    fn next_epoch_fails_closed_on_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reach epoch 3, then corrupt the persisted file.
+        assert_eq!(next_epoch(dir.path()).unwrap(), 1);
+        assert_eq!(next_epoch(dir.path()).unwrap(), 2);
+        assert_eq!(next_epoch(dir.path()).unwrap(), 3);
+        std::fs::write(dir.path().join(EPOCH_FILE), b"not-a-number").unwrap();
+        // A present-but-unparsable epoch must NOT reset to 0 (that regression is
+        // the resurrection the epoch guards against) — it fails closed so the
+        // caller declines to open a session.
+        assert!(
+            next_epoch(dir.path()).is_err(),
+            "a corrupt epoch file must fail closed, not regress to 0"
+        );
+    }
+
+    #[test]
     fn start_handshake_builds_a_decodable_client_hello() {
         let (id, _) = enrolled();
-        let (_hs, bytes) = start_handshake(&id).unwrap();
+        let (_hs, bytes) = start_handshake(&id, 7).unwrap();
         let hello: ClientHello = wire::decode(&bytes).unwrap();
         assert_eq!(hello.client_eph.len(), 32);
         assert_eq!(hello.cert_der, id.cert_der);
         assert_eq!(hello.sig.len(), 64);
+        assert_eq!(
+            hello.epoch, 7,
+            "the session epoch is carried in the ClientHello"
+        );
         assert!(
             uuid::Uuid::parse_str(&hello.sid).is_ok(),
             "sid is a fresh UUID"
@@ -310,7 +395,7 @@ mod tests {
         // The whole agent side against the real `respond`: start → finish →
         // open the coordinator's beacon → produce an ack the coordinator opens.
         let (id, ca_key_pem) = enrolled();
-        let (hs, hello_bytes) = start_handshake(&id).unwrap();
+        let (hs, hello_bytes) = start_handshake(&id, 7).unwrap();
         let hello: ClientHello = wire::decode(&hello_bytes).unwrap();
         let resp = coordinator_respond(&id, &hello, &ca_key_pem);
 
@@ -347,7 +432,7 @@ mod tests {
     fn finish_rejects_a_server_hello_not_signed_by_the_pinned_ca() {
         // A MITM signs the ServerHello with a non-CA key → the agent rejects it.
         let (id, _ca_key_pem) = enrolled();
-        let (hs, hello_bytes) = start_handshake(&id).unwrap();
+        let (hs, hello_bytes) = start_handshake(&id, 7).unwrap();
         let hello: ClientHello = wire::decode(&hello_bytes).unwrap();
         let mitm = rcgen::KeyPair::generate().unwrap().serialize_pem();
         let resp = coordinator_respond(&id, &hello, &mitm); // wrong signer
@@ -362,7 +447,7 @@ mod tests {
     #[test]
     fn confirm_rejects_a_beacon_for_a_different_sid() {
         let (id, ca_key_pem) = enrolled();
-        let (hs, hello_bytes) = start_handshake(&id).unwrap();
+        let (hs, hello_bytes) = start_handshake(&id, 7).unwrap();
         let hello: ClientHello = wire::decode(&hello_bytes).unwrap();
         let resp = coordinator_respond(&id, &hello, &ca_key_pem);
         let server_hello = ServerHello {
