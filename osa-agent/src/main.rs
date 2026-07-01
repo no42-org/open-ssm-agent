@@ -21,6 +21,7 @@ mod dispatch;
 mod enroll;
 mod exec;
 mod jobstore;
+mod pty;
 mod session;
 
 #[derive(Parser)]
@@ -104,6 +105,15 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Open an interactive PTY shell locally under `run_as` — validate the shell
+    /// StreamCapability and its privilege drop on this host before the operator
+    /// path exists (parallels `exec`). Basic line-mode passthrough; the polished
+    /// raw-mode client is the operator's `osa shell` (story 4.2).
+    Shell {
+        /// Target unix user; empty runs the agent's own shell.
+        #[arg(long, default_value = "")]
+        run_as: String,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +183,23 @@ async fn main() -> anyhow::Result<()> {
                 }
                 (None, None) => std::process::exit(1),
             }
+        }
+        Command::Shell { run_as } => {
+            let mut session = pty::PtySession::spawn(&run_as, 24, 80)?;
+            tracing::info!(kind = pty::KIND, pid = session.id(), run_as = %run_as, "interactive shell started");
+            // Pump both directions until the shell exits (master EOF) or local stdin
+            // closes, then reap the child so it leaves no orphan.
+            let (mut reader, mut writer) = tokio::io::split(session.take_master());
+            let mut stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+            tokio::select! {
+                _ = tokio::io::copy(&mut reader, &mut stdout) => {}
+                _ = tokio::io::copy(&mut stdin, &mut writer) => {}
+                status = session.wait() => {
+                    tracing::info!(?status, "shell exited");
+                }
+            }
+            session.shutdown().await?;
         }
         Command::Check {
             allowlist,
