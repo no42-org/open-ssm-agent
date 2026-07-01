@@ -37,6 +37,8 @@ libc = "0.2"
 serde.workspace = true
 # Host-local allowlist document (AD-20); operator-editable.
 toml = "0.8"
+# Host fact collection for inventory (AD-15/AD-16); DMI serial is read from sysfs.
+sysinfo = { version = "0.33", default-features = false, features = ["system", "network"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
