@@ -37,10 +37,16 @@ A single Cargo workspace; the dependency direction is the load-bearing rule
 
 ```sh
 make build     # cargo build --workspace
-make verify    # fmt check + clippy (-D warnings) + tests
+make verify    # fast inner loop: fmt check + clippy (-D warnings) + tests
+make verify-ci # full CI parity before pushing (adds Linux clippy + typos/machete/deny)
 ```
 
 Requires Rust ≥ 1.91 (MSRV floor) and `protoc` for `osa-proto` codegen.
+
+`make verify-ci` also runs `make lint-linux`, which clippy-checks the
+`cfg(target_os = "linux")` code inside a Linux container (Docker) — host clippy
+on macOS/Windows skips it, so this is what stops a Linux-only lint from passing
+locally and failing CI. `make verify` stays host-native for a fast inner loop.
 
 ## Contract
 
