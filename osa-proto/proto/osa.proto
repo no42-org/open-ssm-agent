@@ -167,9 +167,45 @@ service Operator {
   // results — output chunks in order, then one terminal outcome. PERMISSION_DENIED
   // on an unauthorized action; a terminal error event if the host is offline.
   rpc Exec(DispatchRequest) returns (stream ExecEvent);
+  // Open an interactive PTY shell on a host and stream it **bidirectionally**
+  // (Epic 4, CAP-3). The first client message MUST be `ShellOpen`; the coordinator
+  // authorizes + audits it (kind "shell" + run_as, deny-by-default RBAC), mints a
+  // fresh stream_id, and opens the shell on the agent. Thereafter operator
+  // keystrokes flow up as `input`, terminal output flows down as `output`, and
+  // either side's close ends the session. PERMISSION_DENIED on an unauthorized
+  // open; a `closed` message when the shell exits or the host is offline.
+  rpc Shell(stream ShellClientMsg) returns (stream ShellServerMsg);
   // Export the append-only, hash-chained audit log (AD-21) for independent
   // verification (`osa audit verify` recomputes the chain client-side).
   rpc ExportAudit(ExportAuditRequest) returns (ExportAuditResponse);
+}
+
+// Operator → coordinator on the `Shell` stream. The first message must be `open`;
+// subsequent ones carry keystrokes or a close.
+message ShellClientMsg {
+  oneof msg {
+    ShellOpen open = 1; // MUST be the first message
+    bytes input = 2;    // operator keystrokes → the PTY
+    bool close = 3;     // operator closes the session (true)
+  }
+}
+
+// The opening request for a `Shell` stream: what host, as whom, and the initial
+// terminal size. The coordinator authorizes on (kind = "shell", host_id, run_as).
+message ShellOpen {
+  string host_id = 1; // target host (a single host, not a selector)
+  string run_as = 2;  // target unix user (AD-19/AD-20)
+  uint32 rows = 3;    // initial terminal rows
+  uint32 cols = 4;    // initial terminal columns
+}
+
+// Coordinator → operator on the `Shell` stream: terminal output, then a single
+// terminal `closed` when the shell exits (or the host was unreachable).
+message ShellServerMsg {
+  oneof msg {
+    bytes output = 1;  // PTY output → the operator's terminal
+    bool closed = 2;   // the shell ended (true)
+  }
 }
 
 message DispatchRequest {

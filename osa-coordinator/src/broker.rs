@@ -25,13 +25,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use osa_core::HostId;
+use osa_core::seal::{Direction, SessionKeys};
 use osa_core::topics::{
-    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, RESULT_UP_FILTER, tenant_from_ctrl_up,
-    tenant_from_heartbeat, tenant_from_hs_up, tenant_from_result_up,
+    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, RESULT_UP_FILTER, STREAM_UP_FILTER,
+    tenant_from_ctrl_up, tenant_from_heartbeat, tenant_from_hs_up, tenant_from_result_up,
+    tenant_from_stream_up,
 };
+use osa_proto::v1::envelope::Kind;
 use osa_proto::v1::job_outcome::Terminal;
 use osa_proto::v1::job_result::Body;
-use osa_proto::v1::{ClientHello, Dispatch, Envelope, JobOutcome, JobResult, ServerHello};
+use osa_proto::v1::{
+    ClientHello, Dispatch, Envelope, JobOutcome, JobResult, ServerHello, ShellParams, StreamFrame,
+};
 use rumqttd::local::{LinkRx, LinkTx};
 use rumqttd::{
     Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
@@ -64,7 +69,81 @@ pub enum BridgeCommand {
     OnlineHosts {
         reply: tokio::sync::oneshot::Sender<Vec<HostId>>,
     },
+    /// Open an interactive shell on `host_id` (Epic 4): derive the per-stream subkey
+    /// from the host's session, send a `kind = "shell"` dispatch, and route the
+    /// agent's sealed stream frames to `output`. `stream_id` is a fresh,
+    /// never-recycled id — it keys the per-stream AEAD subkey (reuse would be
+    /// catastrophic nonce reuse). A `closed` frame reaches `output` if the host is
+    /// offline.
+    OpenShell {
+        host_id: HostId,
+        stream_id: String,
+        run_as: String,
+        rows: u32,
+        cols: u32,
+        output: mpsc::Sender<StreamFrame>,
+    },
+    /// Operator keystrokes for the live shell on `host_id` (matched by `stream_id`
+    /// so input for a replaced shell is dropped): sealed as a downlink stream frame.
+    ShellInput {
+        host_id: HostId,
+        stream_id: String,
+        data: Vec<u8>,
+    },
+    /// The operator closed the shell: seal a terminal `eof` downlink and tear down.
+    ShellClose { host_id: HostId, stream_id: String },
 }
+
+/// One live interactive shell (coordinator side): the per-stream subkey, its own
+/// downlink `seq` allocator and uplink replay guard, the session `sid` (for sealing
+/// stream frames), the operator's output channel, and the minted `stream_id`.
+struct ShellRoute {
+    stream_id: String,
+    stream_keys: SessionKeys,
+    sid: String,
+    /// Next downlink (coordinator→agent) stream `seq`, from 0.
+    send_seq: u64,
+    /// Highest uplink (agent→coordinator) stream `seq` accepted (replay guard).
+    recv_high: Option<u64>,
+    /// Decoded agent stream frames → the operator's `Shell` response stream.
+    output: mpsc::Sender<StreamFrame>,
+}
+
+impl ShellRoute {
+    /// Seal `frame` as the next downlink stream envelope under the stream subkey,
+    /// allocating a fresh monotonic `seq` (the GCM nonce).
+    fn seal_downlink(&mut self, host_str: &str, frame: &StreamFrame) -> Vec<u8> {
+        let seq = self.send_seq;
+        self.send_seq += 1;
+        let env = osa_core::wire::seal_envelope(
+            &self.stream_keys,
+            Direction::CoordToAgent,
+            host_str,
+            &self.sid,
+            seq,
+            Kind::Stream,
+            &osa_core::wire::encode(frame),
+        );
+        osa_core::wire::encode(&env)
+    }
+
+    /// Open a sealed uplink stream envelope under the stream subkey, authenticating
+    /// **before** advancing the replay guard (a forgery cannot poison it). Returns
+    /// the decoded frame, or `None` on a bad tag / replay / undecodable body.
+    fn open_uplink(&mut self, env: &Envelope) -> Option<StreamFrame> {
+        let plaintext =
+            osa_core::wire::open_envelope(&self.stream_keys, Direction::AgentToCoord, env).ok()?;
+        if self.recv_high.is_some_and(|h| env.seq <= h) {
+            return None;
+        }
+        self.recv_high = Some(env.seq);
+        osa_core::wire::decode(&plaintext).ok()
+    }
+}
+
+/// Live interactive shells keyed by host (one per host in v1). Bounded by the
+/// enrolled-fleet size (one entry per online host).
+type ActiveShells = HashMap<HostId, ShellRoute>;
 
 /// One in-flight dispatched job: the operator's (tagged) result-stream sender plus
 /// a deadline after which it is reaped (so an agent that dies mid-job, or a job
@@ -172,6 +251,7 @@ pub fn spawn(
         HS_UP_FILTER,
         CTRL_UP_FILTER,
         RESULT_UP_FILTER,
+        STREAM_UP_FILTER,
     ] {
         link_tx
             .subscribe(filter)
@@ -255,6 +335,7 @@ async fn run_bridge(
     let mut sessions = SessionStore::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut pending: PendingJobs = HashMap::new();
+    let mut shells: ActiveShells = HashMap::new();
     let mut commands_open = true;
     let mut sweep = tokio::time::interval(PENDING_SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -275,18 +356,21 @@ async fn run_bridge(
                     )
                     .await
                     {
-                        // A (re)established session means any prior jobs for this
-                        // host belong to a dead session — fail them, don't leak.
+                        // A (re)established session means any prior jobs/shells for
+                        // this host belong to a dead session — fail them, don't leak.
                         purge_host_jobs(&mut pending, host);
+                        shells.remove(&host); // drops output → the old operator stream ends
                     }
                 } else if tenant_from_ctrl_up(&topic).is_some() {
                     handle_ctrl_ack(&payload, &mut sessions);
                 } else if let Some(tenant) = tenant_from_result_up(&topic) {
                     handle_result(tenant, &payload, &mut sessions, &mut pending);
+                } else if let Some(tenant) = tenant_from_stream_up(&topic) {
+                    handle_stream_up(tenant, &payload, &mut shells, &mut link_tx);
                 }
             }
             cmd = commands.recv(), if commands_open => match cmd {
-                Some(cmd) => handle_command(cmd, &mut sessions, &mut pending, &mut link_tx),
+                Some(cmd) => handle_command(cmd, &mut sessions, &mut pending, &mut shells, &mut link_tx),
                 None => commands_open = false, // service gone; keep serving the broker
             },
             _ = sweep.tick() => reap_stale_jobs(&mut pending),
@@ -458,6 +542,7 @@ fn handle_command(
     cmd: BridgeCommand,
     sessions: &mut SessionStore,
     pending: &mut PendingJobs,
+    shells: &mut ActiveShells,
     link_tx: &mut LinkTx,
 ) {
     let (host_id, dispatch, events) = match cmd {
@@ -468,6 +553,31 @@ fn handle_command(
         } => (host_id, dispatch, events),
         BridgeCommand::OnlineHosts { reply } => {
             let _ = reply.send(sessions.host_ids());
+            return;
+        }
+        BridgeCommand::OpenShell {
+            host_id,
+            stream_id,
+            run_as,
+            rows,
+            cols,
+            output,
+        } => {
+            open_shell(
+                host_id, stream_id, run_as, rows, cols, output, sessions, shells, link_tx,
+            );
+            return;
+        }
+        BridgeCommand::ShellInput {
+            host_id,
+            stream_id,
+            data,
+        } => {
+            shell_input(host_id, &stream_id, data, shells, link_tx);
+            return;
+        }
+        BridgeCommand::ShellClose { host_id, stream_id } => {
+            shell_close(host_id, &stream_id, shells, link_tx);
             return;
         }
     };
@@ -504,6 +614,155 @@ fn handle_command(
         },
     );
     tracing::info!(host = %host_str, %job_id, kind = %dispatch.kind, "dispatched to agent");
+}
+
+/// Open an interactive shell (Epic 4): derive the per-stream subkey from the host's
+/// session, send a `kind = "shell"` dispatch (sealed on the control channel) to
+/// spawn the PTY, and register the route so uplink stream frames reach `output`. A
+/// terminal `eof` reaches the operator immediately if the host is offline or the
+/// open cannot be published.
+#[allow(clippy::too_many_arguments)]
+fn open_shell(
+    host_id: HostId,
+    stream_id: String,
+    run_as: String,
+    rows: u32,
+    cols: u32,
+    output: mpsc::Sender<StreamFrame>,
+    sessions: &mut SessionStore,
+    shells: &mut ActiveShells,
+    link_tx: &mut LinkTx,
+) {
+    let host_str = host_id.0.to_string();
+    let Some(session) = sessions.get_mut(&host_id) else {
+        let _ = output.try_send(eof_frame());
+        return;
+    };
+    // Derive the per-stream subkey and capture the sid before the mutable seal.
+    let stream_keys = session.derive_stream_keys(stream_id.as_bytes());
+    let sid = session.sid.clone();
+    // Open the shell on the agent: a `kind = "shell"` dispatch whose job_id is the
+    // stream_id, sealed on the control channel (dispatch_down).
+    let dispatch = Dispatch {
+        job_id: stream_id.clone(),
+        kind: "shell".to_string(),
+        run_as,
+        params: osa_core::wire::encode(&ShellParams { rows, cols }),
+    };
+    let sealed = session.seal_downlink(&host_str, &osa_core::wire::encode(&dispatch));
+    if let Err(e) = link_tx.publish(osa_core::topics::dispatch_down(&host_str), sealed) {
+        tracing::warn!(error = %e, host = %host_str, "publishing shell-open dispatch failed");
+        let _ = output.try_send(eof_frame());
+        return;
+    }
+    shells.insert(
+        host_id,
+        ShellRoute {
+            stream_id,
+            stream_keys,
+            sid,
+            send_seq: 0,
+            recv_high: None,
+            output,
+        },
+    );
+    tracing::info!(host = %host_str, "interactive shell opened");
+}
+
+/// Seal operator keystrokes as a downlink stream frame for the live shell. Dropped
+/// if there is no shell for the host, or the `stream_id` names a replaced one.
+fn shell_input(
+    host_id: HostId,
+    stream_id: &str,
+    data: Vec<u8>,
+    shells: &mut ActiveShells,
+    link_tx: &mut LinkTx,
+) {
+    let host_str = host_id.0.to_string();
+    let Some(route) = shells.get_mut(&host_id) else {
+        return;
+    };
+    if route.stream_id != stream_id {
+        return; // input for a shell that was replaced — drop
+    }
+    let sealed = route.seal_downlink(&host_str, &StreamFrame { data, eof: false });
+    if let Err(e) = link_tx.publish(osa_core::topics::stream_down(&host_str), sealed) {
+        tracing::warn!(error = %e, host = %host_str, "publishing shell input failed");
+        shells.remove(&host_id); // link gone → tear down
+    }
+}
+
+/// Close the shell: seal a terminal `eof` downlink so the agent reaps its PTY, then
+/// forget the route (dropping `output` ends the operator's stream).
+fn shell_close(host_id: HostId, stream_id: &str, shells: &mut ActiveShells, link_tx: &mut LinkTx) {
+    let host_str = host_id.0.to_string();
+    let Some(route) = shells.get_mut(&host_id) else {
+        return;
+    };
+    if route.stream_id != stream_id {
+        return;
+    }
+    let sealed = route.seal_downlink(&host_str, &eof_frame());
+    let _ = link_tx.publish(osa_core::topics::stream_down(&host_str), sealed);
+    shells.remove(&host_id);
+}
+
+/// Handle a sealed stream frame on the stream uplink (Epic 4): open it under the
+/// host's shell subkey and forward it to the operator. The shell's terminal `eof`
+/// (or the operator going away) tears the route down — and, if the operator went
+/// away, seals an `eof` downlink so the agent reaps its PTY.
+fn handle_stream_up(tenant: &str, payload: &[u8], shells: &mut ActiveShells, link_tx: &mut LinkTx) {
+    let Ok(host_id) = Uuid::parse_str(tenant).map(HostId) else {
+        return;
+    };
+    let Some(route) = shells.get_mut(&host_id) else {
+        return; // a stream frame for a host with no live shell — drop
+    };
+    let env: Envelope = match osa_core::wire::decode(payload) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let Some(frame) = route.open_uplink(&env) else {
+        return; // bad tag or replay/stale seq
+    };
+    let eof = frame.eof;
+    match route.output.try_send(frame) {
+        Ok(()) => {
+            if eof {
+                // The shell exited (the agent's terminal eof): confirm the close
+                // back to the agent so it reaps its PTY, then forget the route.
+                close_shell_route(route, host_id, link_tx);
+                shells.remove(&host_id);
+            }
+        }
+        Err(TrySendError::Full(_)) => {
+            // Transient backpressure — the operator is momentarily slow. Drop THIS
+            // frame (a recoverable gap in the terminal) rather than kill a live
+            // interactive shell; the buffer drains and later frames deliver.
+            tracing::warn!(host = %host_id.0, "shell output stream full — dropping a frame");
+        }
+        Err(TrySendError::Closed(_)) => {
+            // The operator is gone: tell the agent to reap its PTY, then forget.
+            close_shell_route(route, host_id, link_tx);
+            shells.remove(&host_id);
+        }
+    }
+}
+
+/// Seal a terminal `eof` downlink for a shell so the agent reaps its PTY (a
+/// graceful close in either direction). The caller then drops the route.
+fn close_shell_route(route: &mut ShellRoute, host_id: HostId, link_tx: &mut LinkTx) {
+    let host_str = host_id.0.to_string();
+    let sealed = route.seal_downlink(&host_str, &eof_frame());
+    let _ = link_tx.publish(osa_core::topics::stream_down(&host_str), sealed);
+}
+
+/// A terminal stream frame (empty data, `eof` set).
+fn eof_frame() -> StreamFrame {
+    StreamFrame {
+        data: Vec::new(),
+        eof: true,
+    }
 }
 
 /// Handle a sealed `JobResult` on the result uplink (Epic 3): open it against the
@@ -1572,6 +1831,313 @@ mod tests {
             terminal,
             Some(Terminal::ExitCode(0)),
             "the exit code streamed back"
+        );
+        agent.abort();
+    }
+
+    /// A simulated agent for the shell path: handshake + session, then on the
+    /// `kind = "shell"` dispatch derive the per-stream subkey (from the job_id) and
+    /// echo downlink stream frames back on the uplink (`"echo:" + data`). An input
+    /// containing `exit` also sends a terminal `eof` uplink, as a real PTY would
+    /// when the shell exits.
+    async fn play_agent_shell(
+        ca: Arc<EmbeddedCa>,
+        cert_der: Vec<u8>,
+        key: rcgen::KeyPair,
+        host_str: String,
+        port: u16,
+        ready: tokio::sync::oneshot::Sender<()>,
+        subkey_ready: tokio::sync::oneshot::Sender<()>,
+    ) {
+        use osa_core::handshake::Initiator;
+        use osa_core::seal::{Direction, SessionKeys};
+        use osa_core::topics;
+        use osa_core::wire;
+        use osa_proto::v1::envelope::Kind;
+        use osa_proto::v1::{
+            ClientHello, Dispatch, Envelope, ServerHello, ShellParams, StreamFrame,
+        };
+        use x509_parser::prelude::FromDer;
+
+        let cert_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_der.clone())).into_bytes();
+        let mut opts = MqttOptions::new(host_str.clone(), "localhost", port);
+        opts.set_keep_alive(StdDuration::from_secs(30));
+        opts.set_transport(Transport::tls(
+            ca.ca_root_pem().into_bytes(),
+            Some((cert_pem, key.serialize_pem().into_bytes())),
+            None,
+        ));
+        let (client, mut eventloop) = AsyncClient::new(opts, 16);
+
+        let ca_pub = {
+            let der = ca.ca_root_der();
+            let (_, root) = x509_parser::prelude::X509Certificate::from_der(&der).unwrap();
+            root.public_key().subject_public_key.data.to_vec()
+        };
+        let sid = "shell-itest";
+        let (mut initiator, hello) =
+            Initiator::start(sid.as_bytes(), &cert_der, &key.serialize_pem())
+                .map(|(i, h)| (Some(i), h))
+                .unwrap();
+        let client_hello = ClientHello {
+            sid: sid.into(),
+            client_eph: hello.client_eph.to_vec(),
+            cert_der: cert_der.clone(),
+            sig: hello.sig,
+        };
+
+        let mut keys: Option<SessionKeys> = None; // control session keys
+        let mut stream_keys: Option<SessionKeys> = None; // per-stream subkey
+        let mut ctrl_seq = 0u64; // control uplink seq (the ack)
+        let mut stream_seq = 0u64; // stream uplink seq, from 0
+        let mut ready = Some(ready);
+        let mut subkey_ready = Some(subkey_ready);
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    for t in [
+                        topics::hs_down(&host_str),
+                        topics::ctrl_down(&host_str),
+                        topics::dispatch_down(&host_str),
+                        topics::stream_down(&host_str),
+                    ] {
+                        client.subscribe(t, QoS::AtLeastOnce).await.unwrap();
+                    }
+                    client
+                        .publish(
+                            topics::hs_up(&host_str),
+                            QoS::AtLeastOnce,
+                            false,
+                            wire::encode(&client_hello),
+                        )
+                        .await
+                        .unwrap();
+                }
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    if p.topic == topics::hs_down(&host_str) {
+                        let sh: ServerHello = wire::decode(&p.payload).unwrap();
+                        let server_eph: [u8; 32] = sh.server_eph.as_slice().try_into().unwrap();
+                        keys = Some(
+                            initiator
+                                .take()
+                                .unwrap()
+                                .finish(&server_eph, &sh.sig, &ca_pub)
+                                .unwrap(),
+                        );
+                    } else if p.topic == topics::ctrl_down(&host_str) {
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        let k = keys.as_ref().unwrap();
+                        wire::open_envelope(k, Direction::CoordToAgent, &env).unwrap();
+                        let ack = wire::seal_envelope(
+                            k,
+                            Direction::AgentToCoord,
+                            &host_str,
+                            sid,
+                            ctrl_seq,
+                            Kind::Control,
+                            wire::CTRL_SESSION_ACK,
+                        );
+                        ctrl_seq += 1;
+                        client
+                            .publish(
+                                topics::ctrl_up(&host_str),
+                                QoS::AtLeastOnce,
+                                false,
+                                wire::encode(&ack),
+                            )
+                            .await
+                            .unwrap();
+                        if let Some(r) = ready.take() {
+                            let _ = r.send(());
+                        }
+                    } else if p.topic == topics::dispatch_down(&host_str) {
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        let k = keys.as_ref().unwrap();
+                        let pt = wire::open_envelope(k, Direction::CoordToAgent, &env).unwrap();
+                        let dispatch: Dispatch = wire::decode(&pt).unwrap();
+                        assert_eq!(dispatch.kind, "shell", "the bridge opens a shell dispatch");
+                        let _params: ShellParams = wire::decode(&dispatch.params).unwrap();
+                        // Derive the SAME per-stream subkey the bridge derived.
+                        stream_keys = Some(k.derive_stream(dispatch.job_id.as_bytes()));
+                        // Signal readiness so the test sends input only after the
+                        // subkey exists (no cross-topic race, no blind sleep).
+                        if let Some(r) = subkey_ready.take() {
+                            let _ = r.send(());
+                        }
+                    } else if p.topic == topics::stream_down(&host_str) {
+                        // A stream frame before the dispatch (cross-topic reorder) has
+                        // no subkey yet — skip it, as the real agent does.
+                        let Some(sk) = stream_keys.as_ref() else {
+                            continue;
+                        };
+                        let env: Envelope = wire::decode(&p.payload).unwrap();
+                        let pt = wire::open_envelope(sk, Direction::CoordToAgent, &env).unwrap();
+                        let frame: StreamFrame = wire::decode(&pt).unwrap();
+                        if frame.eof {
+                            continue; // operator closed
+                        }
+                        let mut data = b"echo:".to_vec();
+                        data.extend_from_slice(&frame.data);
+                        let exit = frame.data.windows(4).any(|w| w == b"exit");
+                        let echo = wire::seal_envelope(
+                            sk,
+                            Direction::AgentToCoord,
+                            &host_str,
+                            sid,
+                            stream_seq,
+                            Kind::Stream,
+                            &wire::encode(&StreamFrame { data, eof: false }),
+                        );
+                        stream_seq += 1;
+                        client
+                            .publish(
+                                topics::stream_up(&host_str),
+                                QoS::AtLeastOnce,
+                                false,
+                                wire::encode(&echo),
+                            )
+                            .await
+                            .unwrap();
+                        if exit {
+                            let eof = wire::seal_envelope(
+                                sk,
+                                Direction::AgentToCoord,
+                                &host_str,
+                                sid,
+                                stream_seq,
+                                Kind::Stream,
+                                &wire::encode(&StreamFrame {
+                                    data: Vec::new(),
+                                    eof: true,
+                                }),
+                            );
+                            stream_seq += 1;
+                            client
+                                .publish(
+                                    topics::stream_up(&host_str),
+                                    QoS::AtLeastOnce,
+                                    false,
+                                    wire::encode(&eof),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// End-to-end over the real broker: an operator opens an interactive shell; the
+    /// bridge derives the per-stream subkey, opens it on a live agent, relays sealed
+    /// keystrokes down and the agent's sealed output up, and closes on `eof`.
+    #[tokio::test]
+    async fn an_operator_shell_streams_bidirectionally_end_to_end() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap());
+        let server = ca.issue_server_cert(&["localhost"]).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BROKER_CERT), &server.cert_pem).unwrap();
+        std::fs::write(dir.path().join(BROKER_KEY), &server.key_pem).unwrap();
+        std::fs::write(dir.path().join(CA_CERT), ca.ca_root_pem()).unwrap();
+        let port = free_port();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        spawn(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            dir.path(),
+            ca.clone(),
+            Arc::new(crate::revocation::RevocationRegistry::new()),
+            cmd_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        let host = HostId::new();
+        let (cert_der, key) = enroll_host(&ca, host).await;
+        let host_str = host.0.to_string();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (subkey_tx, subkey_rx) = tokio::sync::oneshot::channel();
+        let agent = tokio::spawn(play_agent_shell(
+            ca.clone(),
+            cert_der,
+            key,
+            host_str,
+            port,
+            ready_tx,
+            subkey_tx,
+        ));
+        tokio::time::timeout(StdDuration::from_secs(8), ready_rx)
+            .await
+            .expect("agent should establish a session")
+            .unwrap();
+
+        // The operator opens a shell; the bridge sends the shell-open dispatch.
+        let (output_tx, mut output_rx) = mpsc::channel::<StreamFrame>(16);
+        cmd_tx
+            .send(BridgeCommand::OpenShell {
+                host_id: host,
+                stream_id: "shell-1".into(),
+                run_as: String::new(),
+                rows: 24,
+                cols: 80,
+                output: output_tx,
+            })
+            .await
+            .unwrap();
+        // Wait until the agent has derived the stream subkey (readiness signal, not a
+        // blind sleep) before sending input — avoids a cross-topic race.
+        tokio::time::timeout(StdDuration::from_secs(8), subkey_rx)
+            .await
+            .expect("agent should receive the shell-open dispatch")
+            .unwrap();
+
+        // Keystrokes down → the agent echoes them back up over the sealed stream.
+        cmd_tx
+            .send(BridgeCommand::ShellInput {
+                host_id: host,
+                stream_id: "shell-1".into(),
+                data: b"ping\n".to_vec(),
+            })
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(StdDuration::from_secs(8), output_rx.recv())
+            .await
+            .expect("shell output timed out")
+            .expect("shell output stream closed early");
+        assert!(!frame.eof);
+        assert_eq!(
+            frame.data, b"echo:ping\n",
+            "the operator's keystrokes echo back over the sealed stream"
+        );
+
+        // An "exit" makes the (simulated) shell send a terminal eof up.
+        cmd_tx
+            .send(BridgeCommand::ShellInput {
+                host_id: host,
+                stream_id: "shell-1".into(),
+                data: b"exit\n".to_vec(),
+            })
+            .await
+            .unwrap();
+        let mut saw_eof = false;
+        while let Ok(Some(f)) =
+            tokio::time::timeout(StdDuration::from_secs(8), output_rx.recv()).await
+        {
+            if f.eof {
+                saw_eof = true;
+                break;
+            }
+        }
+        assert!(
+            saw_eof,
+            "the shell's exit closes the operator stream with an eof"
+        );
+        // The bridge dropped the route on eof → the operator's output channel closes.
+        assert!(
+            output_rx.recv().await.is_none(),
+            "the operator stream ends after the shell's eof"
         );
         agent.abort();
     }

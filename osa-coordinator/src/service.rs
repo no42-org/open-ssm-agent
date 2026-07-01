@@ -23,12 +23,13 @@ use osa_proto::v1::operator_server::Operator;
 use osa_proto::v1::{
     ActionDescriptor, Dispatch, DispatchRequest, DispatchResponse, EnrollRequest, EnrollResponse,
     ExecEvent, ExportAuditRequest, ExportAuditResponse, JobResult, MintTokenRequest,
-    MintTokenResponse, RenewRequest, RenewResponse, RevokeRequest, RevokeResponse,
+    MintTokenResponse, RenewRequest, RenewResponse, RevokeRequest, RevokeResponse, ShellClientMsg,
+    ShellOpen, ShellServerMsg, StreamFrame,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::broker::{BridgeCommand, HostResult};
 use crate::ca::EmbeddedCa;
@@ -115,6 +116,38 @@ impl OperatorService {
         Ok(decision)
     }
 
+    /// Authorize (and audit) a shell open: parse the `host_id`, then run the
+    /// deny-by-default RBAC PDP on (kind = "shell", host, run_as). Returns the host
+    /// on allow, else a `Status` (INVALID_ARGUMENT / PERMISSION_DENIED) — no PTY is
+    /// opened on a malformed or denied request. Extracted from [`Self::shell`] so the
+    /// security-critical gate is unit-testable without a gRPC stream.
+    async fn authorize_shell_open(
+        &self,
+        subject: &str,
+        open: &ShellOpen,
+    ) -> Result<HostId, Status> {
+        let host = open
+            .host_id
+            .parse::<uuid::Uuid>()
+            .map(HostId)
+            .map_err(|_| Status::invalid_argument("host_id is not a UUID"))?;
+        let action = ActionDescriptor {
+            kind: "shell".to_string(),
+            target: open.host_id.clone(),
+            run_as: open.run_as.clone(),
+            params_hash: Vec::new(),
+        };
+        match self.authorize_and_audit(subject, &action).await? {
+            Decision::Allow => Ok(host),
+            Decision::Deny => {
+                tracing::info!(operator = %subject, host = %open.host_id, "shell denied");
+                Err(Status::permission_denied(
+                    "not authorized to open a shell here",
+                ))
+            }
+        }
+    }
+
     /// Resolve an exec target selector to host_ids (3.4). `*` → every host with a
     /// live session (asked of the bridge); otherwise a comma-separated list of
     /// host_id UUIDs. Tag/group selectors await the inventory (Epic 5).
@@ -178,6 +211,18 @@ fn to_exec_event(host: HostId, result: JobResult) -> ExecEvent {
         host_id: host.0.to_string(),
         event,
     }
+}
+
+/// Map a decoded agent stream frame to the operator-facing `ShellServerMsg`: an
+/// `eof` frame becomes the terminal `closed`, everything else is `output` bytes.
+fn to_shell_server_msg(frame: StreamFrame) -> ShellServerMsg {
+    use osa_proto::v1::shell_server_msg::Msg;
+    let msg = if frame.eof {
+        Msg::Closed(true)
+    } else {
+        Msg::Output(frame.data)
+    };
+    ShellServerMsg { msg: Some(msg) }
 }
 
 /// A per-host terminal error result, surfaced as an event so the fan-out keeps
@@ -359,6 +404,91 @@ impl Operator for OperatorService {
 
         let stream = ReceiverStream::new(events_rx).map(|(host, jr)| Ok(to_exec_event(host, jr)));
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    type ShellStream = Pin<Box<dyn Stream<Item = Result<ShellServerMsg, Status>> + Send>>;
+
+    async fn shell(
+        &self,
+        request: Request<Streaming<ShellClientMsg>>,
+    ) -> Result<Response<Self::ShellStream>, Status> {
+        let subject = operator_of(&request);
+        let mut inbound = request.into_inner();
+        // The first client message MUST be ShellOpen.
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("shell stream closed before ShellOpen"))?;
+        let open = match first.msg {
+            Some(osa_proto::v1::shell_client_msg::Msg::Open(o)) => o,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first shell message must be ShellOpen",
+                ));
+            }
+        };
+        // Authorize + audit the open (kind "shell" + run_as, deny-by-default RBAC),
+        // exactly like a dispatch — no PTY is opened on a denied request.
+        let host = self.authorize_shell_open(&subject, &open).await?;
+
+        // Mint a fresh, never-recycled stream_id (it keys the per-stream AEAD subkey;
+        // reuse would be catastrophic nonce reuse).
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        let (output_tx, output_rx) = mpsc::channel::<StreamFrame>(EXEC_EVENT_QUEUE);
+        if self
+            .bridge
+            .send(BridgeCommand::OpenShell {
+                host_id: host,
+                stream_id: stream_id.clone(),
+                run_as: open.run_as,
+                rows: open.rows,
+                cols: open.cols,
+                output: output_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::unavailable("dispatch bridge unavailable"));
+        }
+        tracing::info!(operator = %subject, host = %open.host_id, "shell opened");
+
+        // Pump operator input (keystrokes / close) to the bridge; the client stream
+        // ending (disconnect) closes the shell so the agent reaps its PTY.
+        let bridge = self.bridge.clone();
+        let input_stream_id = stream_id.clone();
+        tokio::spawn(async move {
+            // Ends when the client stream closes (`Ok(None)`/`Err` fail the while-let)
+            // or the operator sends `Close`.
+            while let Ok(Some(msg)) = inbound.message().await {
+                match msg.msg {
+                    Some(osa_proto::v1::shell_client_msg::Msg::Input(data)) => {
+                        if bridge
+                            .send(BridgeCommand::ShellInput {
+                                host_id: host,
+                                stream_id: input_stream_id.clone(),
+                                data,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(osa_proto::v1::shell_client_msg::Msg::Close(_)) => break,
+                    _ => {} // a stray second Open or an empty message — ignore
+                }
+            }
+            let _ = bridge
+                .send(BridgeCommand::ShellClose {
+                    host_id: host,
+                    stream_id: input_stream_id,
+                })
+                .await;
+        });
+
+        // Response: decoded agent stream frames → ShellServerMsg (output, then closed).
+        let out = ReceiverStream::new(output_rx).map(|frame| Ok(to_shell_server_msg(frame)));
+        Ok(Response::new(Box::pin(out)))
     }
 
     async fn export_audit(
@@ -797,6 +927,90 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn shell_policy() -> Arc<crate::policy::RbacPolicyEngine> {
+        Arc::new(
+            crate::policy::RbacPolicyEngine::from_toml(
+                r#"
+                [[binding]]
+                subject = "alice@example"
+                verbs = ["shell"]
+                selectors = ["*"]
+                run_as = ["deploy"]
+            "#,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn shell_open(host: &str, run_as: &str) -> ShellOpen {
+        ShellOpen {
+            host_id: host.into(),
+            run_as: run_as.into(),
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_open_is_allowed_by_a_matching_binding() {
+        let svc = service_with_policy(shell_policy());
+        let host = svc
+            .authorize_shell_open("alice@example", &shell_open(HOST, "deploy"))
+            .await
+            .unwrap();
+        assert_eq!(host.0.to_string(), HOST);
+    }
+
+    #[tokio::test]
+    async fn shell_open_is_denied_without_a_binding() {
+        // Deny-by-default: the empty-policy service denies a shell open.
+        let err = service()
+            .authorize_shell_open("alice@example", &shell_open(HOST, "deploy"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn shell_open_enforces_run_as() {
+        // The #22 run_as axis applies to shells too: an ungranted user is denied.
+        let svc = service_with_policy(shell_policy());
+        assert!(
+            svc.authorize_shell_open("alice@example", &shell_open(HOST, "deploy"))
+                .await
+                .is_ok()
+        );
+        let err = svc
+            .authorize_shell_open("alice@example", &shell_open(HOST, "root"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn shell_open_with_a_non_uuid_host_is_invalid() {
+        let err = service()
+            .authorize_shell_open("alice@example", &shell_open("not-a-uuid", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn to_shell_server_msg_maps_output_and_eof() {
+        use osa_proto::v1::shell_server_msg::Msg;
+        let out = to_shell_server_msg(StreamFrame {
+            data: b"hi".to_vec(),
+            eof: false,
+        });
+        assert!(matches!(out.msg, Some(Msg::Output(d)) if d == b"hi"));
+        let closed = to_shell_server_msg(StreamFrame {
+            data: Vec::new(),
+            eof: true,
+        });
+        assert!(matches!(closed.msg, Some(Msg::Closed(true))));
     }
 
     #[tokio::test]

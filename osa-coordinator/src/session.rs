@@ -54,6 +54,15 @@ impl Session {
         wire::encode(&env)
     }
 
+    /// Derive the independent per-stream subkey for an interactive shell (Epic 4)
+    /// from this session's keys and a **unique** `stream_id`. The stream then owns
+    /// its own `(key, seq)` nonce space disjoint from the control channel; the
+    /// coordinator mints a fresh stream_id per shell and never recycles it (reuse
+    /// would be catastrophic AEAD nonce reuse — see [`SessionKeys::derive_stream`]).
+    pub fn derive_stream_keys(&self, stream_id: &[u8]) -> SessionKeys {
+        self.keys.derive_stream(stream_id)
+    }
+
     /// Open a sealed uplink envelope (agent→coordinator), authenticating **before**
     /// advancing the replay guard (so a forged envelope can't poison it). Returns
     /// the plaintext, or `None` if the tag fails or the `seq` is a replay/stale.
