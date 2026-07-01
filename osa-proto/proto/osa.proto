@@ -78,6 +78,25 @@ message ExecParams {
   repeated string argv = 1;
 }
 
+// The shell capability's params (Epic 4, CAP-3). Carried in a `Dispatch` with
+// `kind = "shell"`; the `Dispatch.job_id` doubles as the **stream_id** that keys
+// the per-stream AEAD subkey. The agent decodes these to size the PTY; the
+// coordinator never parses them (capability-agnostic, AD-12).
+message ShellParams {
+  uint32 rows = 1; // initial terminal rows
+  uint32 cols = 2; // initial terminal columns
+}
+
+// One frame of an interactive stream (Epic 4), the **sealed** payload of a
+// `KIND_STREAM` envelope on `…/up|down/stream`. Both directions share this shape:
+// operator→host keystrokes downlink, host→operator terminal output uplink. `eof`
+// (with empty `data`) is the terminal frame — the agent sends it when the shell
+// exits, the coordinator sends it to close the session.
+message StreamFrame {
+  bytes data = 1;
+  bool eof = 2;
+}
+
 // Agent → coordinator, **sealed** on `…/up/result` (#20, Epic 3). A job streams
 // many `OutputChunk`s in order followed by exactly one terminal `JobOutcome`.
 message JobResult {
