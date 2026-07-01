@@ -45,9 +45,12 @@ jobs:
         with:
           tool: cargo-machete
       - name: cargo-machete
-        run: cargo machete
+        run: make machete
 
-  # Spelling in source, comments, and docs.
+  # Spelling in source, comments, and docs. The upstream action is the canonical
+  # SHA-pinned installer+runner; the Makefile's `typos` target pins TYPOS_VERSION
+  # to this SAME version so `make verify-ci` locally can't flag a different word
+  # set than CI (the 4.3a drift). Keep the two versions in lockstep on any bump.
   typos:
     name: typos
     runs-on: ubuntu-latest
@@ -78,4 +81,4 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Coverage summary
-        run: cargo llvm-cov --workspace --summary-only
+        run: make coverage
