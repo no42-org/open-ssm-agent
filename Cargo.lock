@@ -2249,9 +2249,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
+ "nix",
  "osa-core",
  "osa-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
