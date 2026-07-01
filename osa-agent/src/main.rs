@@ -20,6 +20,7 @@ mod control_channel;
 mod dispatch;
 mod enroll;
 mod exec;
+mod inventory;
 mod jobstore;
 mod pty;
 mod session;
@@ -115,6 +116,10 @@ enum Command {
         #[arg(long, default_value = "")]
         run_as: String,
     },
+    /// Collect and print this host's inventory snapshot (AD-15/AD-16) — validate
+    /// the collectors on this host before the reporting path exists (parallels
+    /// `check`/`exec`). A missing DMI serial is shown as a gap, not an error.
+    Inventory,
 }
 
 #[tokio::main]
@@ -201,6 +206,29 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             session.shutdown().await?;
+        }
+        Command::Inventory => {
+            let inv = inventory::collect();
+            println!(
+                "dmi_serial: {}",
+                inv.dmi_serial.as_deref().unwrap_or("<none>")
+            );
+            println!("hostname:   {}", inv.system.hostname);
+            println!("os:         {}", inv.system.os);
+            println!("kernel:     {}", inv.system.kernel);
+            println!("cpus:       {}", inv.system.cpu_count);
+            println!("memory:     {} bytes", inv.system.memory_bytes);
+            println!("interfaces:");
+            for iface in &inv.interfaces {
+                let ips: Vec<String> = iface.ips.iter().map(|ip| ip.to_string()).collect();
+                println!("  {} [{}] {}", iface.name, iface.mac, ips.join(", "));
+            }
+            if !inv.gaps.is_empty() {
+                println!("gaps:");
+                for gap in &inv.gaps {
+                    println!("  {}: {}", gap.field.as_str(), gap.reason);
+                }
+            }
         }
         Command::Check {
             allowlist,
