@@ -25,7 +25,10 @@
 //! doesn't lose the snapshot; a permanent error (a 4xx → [`PortError::Invalid`])
 //! fails fast. A device already claimed by a **different** host_id (a cloned or
 //! duplicated serial) is a [`UpsertOutcome::HostCollision`]: alert, write nothing
-//! (5.2b-2b) — never steal the record.
+//! (5.2b-2b). The check reads the claim at match time, so the guarantee is
+//! **per-host-sequential** — two distinct hosts racing to claim the same
+//! *unclaimed* device can both write once (last-writer-wins); the loser then sees
+//! the foreign stamp and collides on its next report.
 //!
 //! Deferred to 5.2b-2:
 //! - record **creation** (count==0, with the Device-vs-VM branch + operator-
@@ -42,6 +45,13 @@
 //!   coordinator. See the README.
 //!
 //! # Known gaps
+//! - A **re-enrolled** host gets a fresh host_id (UUIDv4) but keeps its DMI serial,
+//!   so its device stays claimed by the OLD host_id → `HostCollision` on every
+//!   report until an operator clears `osa_host_id`. The check can't tell re-enroll
+//!   (same hardware) from a cloned serial; auto-recovery needs a revocation
+//!   cross-check or an operator override (tracked for 5.2b-2).
+//! - An unresolved collision re-alerts every report (it is deliberately not
+//!   deduped, so it recovers once resolved); suppress-until-changed is a follow-up.
 //! - AD-16 prefers `Bearer` auth; the `netbox` crate hardcodes `Token` (NetBox
 //!   accepts both), so the preference is currently unmet.
 
@@ -294,16 +304,13 @@ impl<D: NetboxDevices> NetboxInventorySink<D> {
                 // AD-16: never guess which host. If the device is already claimed by
                 // a DIFFERENT host_id (a cloned/duplicated serial), alert and write
                 // nothing rather than stealing it. An empty/matching stamp proceeds.
-                let ours = host_id.0.to_string();
-                if device
-                    .host_id
-                    .as_deref()
-                    .is_some_and(|h| !h.is_empty() && h != ours)
+                if let Some(claimed) = device.host_id.as_deref().filter(|h| !h.is_empty())
+                    && claimed != host_id.0.to_string()
                 {
                     tracing::error!(
                         serial,
                         host = %host_id.0,
-                        claimed_by = %device.host_id.as_deref().unwrap_or(""),
+                        claimed_by = claimed,
                         "NetBox: device already claimed by a different host — refusing to overwrite (AD-16)"
                     );
                     return Ok(UpsertOutcome::HostCollision);
@@ -775,23 +782,21 @@ mod tests {
     #[async_trait]
     impl NetboxDevices for FakeDevices {
         async fn match_by_serial(&self, serial: &str) -> Result<SerialMatch, PortError> {
-            {
-                let mut s = self.state.lock().unwrap();
-                s.match_attempts += 1;
-                if s.permanent_failure {
-                    return Err(PortError::Invalid("permanent".into()));
-                }
-                if s.transient_failures > 0 {
-                    s.transient_failures -= 1;
-                    return Err(PortError::Backend("transient".into()));
-                }
+            let mut s = self.state.lock().unwrap();
+            s.match_attempts += 1;
+            if s.permanent_failure {
+                return Err(PortError::Invalid("permanent".into()));
             }
-            let s = self.state.lock().unwrap();
+            if s.transient_failures > 0 {
+                s.transient_failures -= 1;
+                return Err(PortError::Backend("transient".into()));
+            }
             Ok(match self.by_serial.get(serial).map(Vec::as_slice) {
                 None | Some([]) => SerialMatch::None,
                 Some([id]) => SerialMatch::One(DeviceRef {
                     id: *id,
-                    host_id: s.host_ids.get(id).cloned(),
+                    // Mirror the real client: an empty stamp normalizes to None.
+                    host_id: s.host_ids.get(id).filter(|h| !h.is_empty()).cloned(),
                 }),
                 Some(many) => SerialMatch::Many(many.len()),
             })
@@ -1200,6 +1205,20 @@ mod tests {
         let sink = NetboxInventorySink::new(
             FakeDevices::matching("SN", &[7]).claimed_by(7, &host.0.to_string()),
         );
+        assert_eq!(
+            sink.upsert(host, &inventory(Some("SN"), vec![]))
+                .await
+                .unwrap(),
+            UpsertOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_stamp_is_treated_as_unclaimed() {
+        let host = HostId::new();
+        // A present-but-blank osa_host_id normalizes to None (like the real client),
+        // so it's an unclaimed device — not a collision.
+        let sink = NetboxInventorySink::new(FakeDevices::matching("SN", &[7]).claimed_by(7, ""));
         assert_eq!(
             sink.upsert(host, &inventory(Some("SN"), vec![]))
                 .await

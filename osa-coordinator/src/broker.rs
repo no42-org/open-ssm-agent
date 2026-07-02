@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use osa_core::HostId;
-use osa_core::ports::InventorySink;
+use osa_core::ports::{InventorySink, UpsertOutcome};
 use osa_core::seal::{Direction, SessionKeys};
 use osa_core::topics::{
     CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, INVENTORY_UP_FILTER, RESULT_UP_FILTER,
@@ -406,7 +406,12 @@ async fn run_bridge(
                                 tokio::spawn(async move {
                                     let _permit = permit; // released when the upsert finishes
                                     match sink.upsert(host, &inv).await {
-                                        Ok(outcome) => tracing::info!(host = %host.0, ?outcome, "inventory reconciled to NetBox"),
+                                        // Only `Updated` actually wrote. A collision /
+                                        // ambiguous match wrote nothing and is already
+                                        // alert-logged (with serial + claimant) inside
+                                        // the sink; don't mislabel it as a reconcile.
+                                        Ok(UpsertOutcome::Updated) => tracing::info!(host = %host.0, "inventory reconciled to NetBox"),
+                                        Ok(outcome) => tracing::debug!(host = %host.0, ?outcome, "inventory upsert wrote nothing"),
                                         Err(e) => tracing::warn!(host = %host.0, error = %e, "inventory upsert to NetBox failed"),
                                     }
                                 });
