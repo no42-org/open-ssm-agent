@@ -21,12 +21,15 @@
 //! owns the full observed set), and stamps the `host_id`. An unchanged snapshot is
 //! a **content-hash-deduped** no-op (5.2b-1).
 //!
+//! A **transient** NetBox failure is retried with backoff (5.2b-2a) so a blip
+//! doesn't lose the snapshot; a permanent error (a 4xx → [`PortError::Invalid`])
+//! fails fast.
+//!
 //! Deferred to 5.2b-2:
 //! - record **creation** (count==0, with the Device-vs-VM branch + operator-
 //!   configured defaults for the required human-curated fields),
-//! - MAC sync (NetBox 4.2+ `MACAddress` objects),
-//! - the two-hosts-per-device alert, and
-//! - transient-error retry/queue.
+//! - MAC sync (NetBox 4.2+ `MACAddress` objects), and
+//! - the two-hosts-per-device alert.
 //!
 //! # Deployment preconditions
 //! - A text custom field named [`CF_HOST_ID`] bound to `dcim.device` MUST exist,
@@ -54,6 +57,20 @@ use osa_proto::v1::Inventory;
 /// The NetBox custom field the agent's `host_id` is stamped onto (AD-16). It is
 /// agent-owned, so writing it never collides with human-curated fields.
 pub const CF_HOST_ID: &str = "osa_host_id";
+
+/// Retries for a **transient** NetBox failure before giving up the snapshot
+/// (AD-16: a transient error is retried, not lost). A longer outage is covered by
+/// the agent's periodic re-report (5.3) — inventory is idempotent.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+/// Base backoff; doubles per attempt (100ms → 200ms → 400ms).
+const RETRY_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a port error is worth retrying — a backend/transport blip, not a
+/// permanent client error (a 4xx maps to [`PortError::Invalid`], e.g. a missing
+/// custom field, which retrying can't fix).
+fn is_transient(e: &PortError) -> bool {
+    matches!(e, PortError::Backend(_) | PortError::Transport(_))
+}
 
 /// A NetBox device the sink matched — its id is enough to field-scope-update it.
 /// Ids are `i64` (NetBox uses `BigAutoField`); the seam never truncates them.
@@ -261,6 +278,36 @@ impl<D: NetboxDevices> NetboxInventorySink<D> {
         }
         Ok(())
     }
+
+    /// Match on the serial and reconcile the single match — the retryable core of
+    /// [`InventorySink::upsert`]. Does NOT touch the dedup cache (the caller marks a
+    /// successful `Updated`, so a retried transient failure never marks synced).
+    async fn match_and_reconcile(
+        &self,
+        serial: &str,
+        host_id: HostId,
+        observed: &Inventory,
+    ) -> Result<UpsertOutcome, PortError> {
+        match self.devices.match_by_serial(serial).await? {
+            SerialMatch::None => Ok(UpsertOutcome::Unmatched),
+            SerialMatch::One(device) => {
+                self.reconcile(device.id, host_id, observed).await?;
+                Ok(UpsertOutcome::Updated)
+            }
+            SerialMatch::Many(count) => {
+                // AD-16: count>1 → alert, never blind-write. Two devices sharing a
+                // serial is a data-quality problem an operator must resolve; the
+                // sink must not guess which one is the real host.
+                tracing::error!(
+                    serial,
+                    count,
+                    host = %host_id.0,
+                    "NetBox: multiple devices match the DMI serial — refusing to write (AD-16)"
+                );
+                Ok(UpsertOutcome::AmbiguousMatch { count })
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -295,26 +342,25 @@ impl<D: NetboxDevices> InventorySink for NetboxInventorySink<D> {
             return Ok(UpsertOutcome::Unchanged);
         }
 
-        match self.devices.match_by_serial(serial).await? {
-            SerialMatch::None => Ok(UpsertOutcome::Unmatched),
-            SerialMatch::One(device) => {
-                self.reconcile(device.id, host_id, observed).await?;
-                self.mark_synced(host_id, hash);
-                Ok(UpsertOutcome::Updated)
+        // Match + reconcile, retrying a transient NetBox failure with backoff so a
+        // blip doesn't lose the snapshot (AD-16). A permanent error (Invalid) or a
+        // non-write outcome (Unmatched/AmbiguousMatch) returns immediately.
+        let mut attempt = 0u32;
+        let outcome = loop {
+            match self.match_and_reconcile(serial, host_id, observed).await {
+                Ok(outcome) => break outcome,
+                Err(e) if is_transient(&e) && attempt < MAX_TRANSIENT_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!(host = %host_id.0, attempt, error = %e, "transient NetBox error — retrying inventory upsert");
+                    tokio::time::sleep(RETRY_BASE_BACKOFF * 2u32.pow(attempt - 1)).await;
+                }
+                Err(e) => return Err(e),
             }
-            SerialMatch::Many(count) => {
-                // AD-16: count>1 → alert, never blind-write. Two devices sharing a
-                // serial is a data-quality problem an operator must resolve; the
-                // sink must not guess which one is the real host.
-                tracing::error!(
-                    serial,
-                    count,
-                    host = %host_id.0,
-                    "NetBox: multiple devices match the DMI serial — refusing to write (AD-16)"
-                );
-                Ok(UpsertOutcome::AmbiguousMatch { count })
-            }
+        };
+        if outcome == UpsertOutcome::Updated {
+            self.mark_synced(host_id, hash);
         }
+        Ok(outcome)
     }
 }
 
@@ -619,6 +665,10 @@ mod tests {
         interfaces: HashMap<i64, Vec<NbInterface>>, // device_id -> interfaces
         next_id: i64,
         finalized: Vec<Finalize>,
+        // Failure injection for the retry tests.
+        match_attempts: u32,
+        transient_failures: u32, // fail `match_by_serial` this many times, then succeed
+        permanent_failure: bool, // fail `match_by_serial` with a non-retryable error
     }
 
     impl FakeDevices {
@@ -633,6 +683,17 @@ mod tests {
                     ..Default::default()
                 }),
             }
+        }
+        fn with_transient_failures(self, n: u32) -> Self {
+            self.state.lock().unwrap().transient_failures = n;
+            self
+        }
+        fn with_permanent_failure(self) -> Self {
+            self.state.lock().unwrap().permanent_failure = true;
+            self
+        }
+        fn match_attempts(&self) -> u32 {
+            self.state.lock().unwrap().match_attempts
         }
         /// One device (`device_id`) matched by `serial`, seeded with `interfaces`.
         fn device(serial: &str, device_id: i64, interfaces: Vec<NbInterface>) -> Self {
@@ -675,6 +736,17 @@ mod tests {
     #[async_trait]
     impl NetboxDevices for FakeDevices {
         async fn match_by_serial(&self, serial: &str) -> Result<SerialMatch, PortError> {
+            {
+                let mut s = self.state.lock().unwrap();
+                s.match_attempts += 1;
+                if s.permanent_failure {
+                    return Err(PortError::Invalid("permanent".into()));
+                }
+                if s.transient_failures > 0 {
+                    s.transient_failures -= 1;
+                    return Err(PortError::Backend("transient".into()));
+                }
+            }
             Ok(match self.by_serial.get(serial).map(Vec::as_slice) {
                 None | Some([]) => SerialMatch::None,
                 Some([id]) => SerialMatch::One(DeviceRef { id: *id }),
@@ -1023,6 +1095,41 @@ mod tests {
         assert_eq!(
             sink.devices.finalized(),
             vec![(7, Some(10), None, host.0.to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_netbox_error_is_retried_until_it_succeeds() {
+        let host = HostId::new();
+        let sink =
+            NetboxInventorySink::new(FakeDevices::matching("SN", &[7]).with_transient_failures(2));
+        assert_eq!(
+            sink.upsert(host, &inventory(Some("SN"), vec![]))
+                .await
+                .unwrap(),
+            UpsertOutcome::Updated
+        );
+        assert_eq!(
+            sink.devices.match_attempts(),
+            3,
+            "2 transient failures then a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_netbox_error_is_not_retried() {
+        let host = HostId::new();
+        let sink =
+            NetboxInventorySink::new(FakeDevices::matching("SN", &[7]).with_permanent_failure());
+        assert!(
+            sink.upsert(host, &inventory(Some("SN"), vec![]))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sink.devices.match_attempts(),
+            1,
+            "a permanent error fails fast, no retry"
         );
     }
 }
