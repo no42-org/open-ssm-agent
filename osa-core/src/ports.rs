@@ -101,6 +101,9 @@ pub trait CertIssuer: Send + Sync {
 pub enum UpsertOutcome {
     /// The single matched record was updated with the observed, field-scoped facts.
     Updated,
+    /// The single matched record already reflected this snapshot (same content
+    /// hash), so the sink wrote nothing — an idempotent no-op (AD-16 dedup).
+    Unchanged,
     /// No record matched the DMI serial (record creation is a later slice).
     Unmatched,
     /// The snapshot carried no usable DMI serial, so no match was attempted —
