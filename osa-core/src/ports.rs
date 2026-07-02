@@ -112,6 +112,10 @@ pub enum UpsertOutcome {
     /// More than one record matched the DMI serial: ambiguous, so the sink raised
     /// an alert and wrote **nothing** (AD-16: `count>1` → alert, never blind-write).
     AmbiguousMatch { count: usize },
+    /// The matched record is already claimed by a **different** host (a cloned or
+    /// duplicated DMI serial across two hosts): the sink alerted and wrote nothing
+    /// rather than stealing the record (AD-16: never guess which host).
+    HostCollision,
 }
 
 /// CMDB sink (AD-16, AD-17). Coordinator-side only — no host holds a write
