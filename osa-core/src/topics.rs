@@ -38,6 +38,10 @@ pub const RESULT_UP_FILTER: &str = "/tenants/+/osa/v1/up/result";
 /// port-forward bytes).
 pub const STREAM_UP_FILTER: &str = "/tenants/+/osa/v1/up/stream";
 
+/// Filter matching every host's sealed inventory uplink (Epic 5 — observed facts
+/// shipped up for the coordinator's NetBox sink, AD-17).
+pub const INVENTORY_UP_FILTER: &str = "/tenants/+/osa/v1/up/inventory";
+
 /// The broker tenant id for a host: its `host_id` with hyphens stripped, so it is
 /// alphanumeric as `validate-tenant-prefix` requires. Must equal the cert's O.
 pub fn tenant(host_id: &str) -> String {
@@ -103,6 +107,13 @@ pub fn stream_up(host_id: &str) -> String {
     format!("{}{ROOT}/up/stream", tenant_prefix(host_id))
 }
 
+/// The sealed inventory uplink: the agent publishes its sealed `Inventory`
+/// snapshot here, and the coordinator subscribes across all tenants via
+/// [`INVENTORY_UP_FILTER`] (Epic 5, AD-17).
+pub fn inventory_up(host_id: &str) -> String {
+    format!("{}{ROOT}/up/inventory", tenant_prefix(host_id))
+}
+
 /// Extract the tenant id (hyphen-stripped host_id) from a topic whose tail after
 /// the tenant segment equals `tail`. The broker confines each client to its own
 /// `/tenants/<O>/…` subtree, so a topic matching the scheme names the tenant that
@@ -136,6 +147,11 @@ pub fn tenant_from_result_up(topic: &str) -> Option<&str> {
 /// Extract the tenant id from a sealed stream uplink topic (Epic 4).
 pub fn tenant_from_stream_up(topic: &str) -> Option<&str> {
     tenant_for_tail(topic, "osa/v1/up/stream")
+}
+
+/// Extract the tenant id from a sealed inventory uplink topic (Epic 5).
+pub fn tenant_from_inventory_up(topic: &str) -> Option<&str> {
+    tenant_for_tail(topic, "osa/v1/up/inventory")
 }
 
 #[cfg(test)]
@@ -208,15 +224,24 @@ mod tests {
             format!("/tenants/{t}/osa/v1/down/stream")
         );
         assert_eq!(stream_up(host), format!("/tenants/{t}/osa/v1/up/stream"));
+        assert_eq!(
+            inventory_up(host),
+            format!("/tenants/{t}/osa/v1/up/inventory")
+        );
         assert_eq!(tenant_from_hs_up(&hs_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_ctrl_up(&ctrl_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_result_up(&result_up(host)), Some(t.as_str()));
         assert_eq!(tenant_from_stream_up(&stream_up(host)), Some(t.as_str()));
+        assert_eq!(
+            tenant_from_inventory_up(&inventory_up(host)),
+            Some(t.as_str())
+        );
         // The filters match the produced shapes.
         assert_eq!(HS_UP_FILTER, "/tenants/+/osa/v1/up/hs");
         assert_eq!(CTRL_UP_FILTER, "/tenants/+/osa/v1/up/ctrl");
         assert_eq!(RESULT_UP_FILTER, "/tenants/+/osa/v1/up/result");
         assert_eq!(STREAM_UP_FILTER, "/tenants/+/osa/v1/up/stream");
+        assert_eq!(INVENTORY_UP_FILTER, "/tenants/+/osa/v1/up/inventory");
     }
 
     #[test]
@@ -229,5 +254,8 @@ mod tests {
         // The stream uplink extractor must not match the downlink or other channels.
         assert_eq!(tenant_from_stream_up(&stream_down(host)), None);
         assert_eq!(tenant_from_stream_up(&result_up(host)), None);
+        // The inventory extractor is likewise channel-specific.
+        assert_eq!(tenant_from_inventory_up(&result_up(host)), None);
+        assert_eq!(tenant_from_inventory_up(&stream_up(host)), None);
     }
 }

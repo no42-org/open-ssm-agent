@@ -25,22 +25,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use osa_core::HostId;
+use osa_core::ports::InventorySink;
 use osa_core::seal::{Direction, SessionKeys};
 use osa_core::topics::{
-    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, RESULT_UP_FILTER, STREAM_UP_FILTER,
-    tenant_from_ctrl_up, tenant_from_heartbeat, tenant_from_hs_up, tenant_from_result_up,
-    tenant_from_stream_up,
+    CTRL_UP_FILTER, HEARTBEAT_FILTER, HS_UP_FILTER, INVENTORY_UP_FILTER, RESULT_UP_FILTER,
+    STREAM_UP_FILTER, tenant_from_ctrl_up, tenant_from_heartbeat, tenant_from_hs_up,
+    tenant_from_inventory_up, tenant_from_result_up, tenant_from_stream_up,
 };
 use osa_proto::v1::envelope::Kind;
 use osa_proto::v1::job_outcome::Terminal;
 use osa_proto::v1::job_result::Body;
 use osa_proto::v1::{
-    ClientHello, Dispatch, Envelope, JobOutcome, JobResult, ServerHello, ShellParams, StreamFrame,
+    ClientHello, Dispatch, Envelope, Inventory, JobOutcome, JobResult, ServerHello, ShellParams,
+    StreamFrame,
 };
 use rumqttd::local::{LinkRx, LinkTx};
 use rumqttd::{
     Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
 };
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{self, Sender, channel, error::TrySendError};
 use uuid::Uuid;
 
@@ -181,6 +184,13 @@ const MAX_TRACKED_HOSTS: usize = 50_000;
 /// Shed messages are recoverable: agents re-handshake on the next reconnect.
 const BRIDGE_QUEUE: usize = 1024;
 
+/// Cap on concurrent in-flight NetBox inventory upserts. Each is a `tokio::spawn`
+/// doing a CMDB round-trip; without a bound, one authenticated host publishing
+/// inventory in a loop could spawn unbounded tasks + connections (memory/CMDB
+/// DoS). Excess is shed — inventory is idempotent and periodic, so a later report
+/// reconciles the dropped snapshot.
+const MAX_INFLIGHT_INVENTORY_UPSERTS: usize = 16;
+
 /// File names the broker reads its TLS material from, written under the cert dir.
 pub const BROKER_CERT: &str = "broker.crt";
 pub const BROKER_KEY: &str = "broker.key";
@@ -201,6 +211,7 @@ pub fn spawn(
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
     epochs: Arc<dyn Epochs>,
+    inventory_sink: Option<Arc<dyn InventorySink>>,
     commands: mpsc::Receiver<BridgeCommand>,
 ) -> anyhow::Result<()> {
     let path = |name: &str| cert_dir.join(name).to_string_lossy().into_owned();
@@ -254,6 +265,7 @@ pub fn spawn(
         CTRL_UP_FILTER,
         RESULT_UP_FILTER,
         STREAM_UP_FILTER,
+        INVENTORY_UP_FILTER,
     ] {
         link_tx
             .subscribe(filter)
@@ -285,6 +297,7 @@ pub fn spawn(
         ca,
         revocations,
         epochs,
+        inventory_sink,
     ));
     Ok(())
 }
@@ -341,12 +354,15 @@ async fn run_bridge(
     ca: Arc<EmbeddedCa>,
     revocations: Arc<dyn Revocations>,
     epochs: Arc<dyn Epochs>,
+    inventory_sink: Option<Arc<dyn InventorySink>>,
 ) {
     let mut sessions = SessionStore::new();
     let mut last_seen: HashMap<String, Instant> = HashMap::new();
     let mut pending: PendingJobs = HashMap::new();
     let mut shells: ActiveShells = HashMap::new();
     let mut commands_open = true;
+    // Bounds concurrent NetBox inventory upserts (see MAX_INFLIGHT_INVENTORY_UPSERTS).
+    let inventory_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_INVENTORY_UPSERTS));
     let mut sweep = tokio::time::interval(PENDING_SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -377,6 +393,27 @@ async fn run_bridge(
                     handle_result(tenant, &payload, &mut sessions, &mut pending);
                 } else if let Some(tenant) = tenant_from_stream_up(&topic) {
                     handle_stream_up(tenant, &payload, &mut shells, &mut link_tx);
+                } else if let Some(tenant) = tenant_from_inventory_up(&topic) {
+                    // Open+decode on the loop (fast); run the NetBox upsert off it,
+                    // so a slow CMDB round-trip never stalls message routing. Only
+                    // when a sink is configured (else the snapshot is dropped).
+                    if let Some(sink) = inventory_sink.clone()
+                        && let Some((host, inv)) = decode_inventory(tenant, &payload, &mut sessions)
+                    {
+                        // Bound concurrent upserts; shed (don't queue) when saturated.
+                        match Arc::clone(&inventory_slots).try_acquire_owned() {
+                            Ok(permit) => {
+                                tokio::spawn(async move {
+                                    let _permit = permit; // released when the upsert finishes
+                                    match sink.upsert(host, &inv).await {
+                                        Ok(outcome) => tracing::info!(host = %host.0, ?outcome, "inventory reconciled to NetBox"),
+                                        Err(e) => tracing::warn!(host = %host.0, error = %e, "inventory upsert to NetBox failed"),
+                                    }
+                                });
+                            }
+                            Err(_) => tracing::warn!(host = %host.0, "inventory upserts saturated — shedding this snapshot (a later report reconciles)"),
+                        }
+                    }
                 }
             }
             cmd = commands.recv(), if commands_open => match cmd {
@@ -854,6 +891,24 @@ fn handle_result(
     }
 }
 
+/// Open a sealed inventory uplink and decode the snapshot (Epic 5, AD-17), or
+/// `None` if the message was dropped — a bad tenant, a malformed envelope, no live
+/// session, a bad tag / replayed seq, or an undecodable snapshot. Returns the
+/// decoded snapshot so the caller can spawn the (potentially slow) NetBox upsert
+/// off the bridge loop; an untrusted broker's garbage drops silently.
+fn decode_inventory(
+    tenant: &str,
+    payload: &[u8],
+    sessions: &mut SessionStore,
+) -> Option<(HostId, Inventory)> {
+    let host_id = Uuid::parse_str(tenant).map(HostId).ok()?;
+    let env: Envelope = osa_core::wire::decode(payload).ok()?;
+    let session = sessions.get_mut(&host_id)?;
+    let plaintext = session.open_uplink(&env)?;
+    let inventory: Inventory = osa_core::wire::decode(&plaintext).ok()?;
+    Some((host_id, inventory))
+}
+
 /// Fail and forget every pending job for `host` — used when the host reconnects
 /// (its old session's jobs can never produce a result against the new keys).
 fn purge_host_jobs(pending: &mut PendingJobs, host: HostId) {
@@ -1107,6 +1162,7 @@ mod tests {
             Arc::new(EmbeddedCa::new(time::Duration::hours(24)).unwrap()),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -1188,6 +1244,7 @@ mod tests {
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -1394,6 +1451,7 @@ mod tests {
             ca.clone(),
             revocations.clone(),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -1478,6 +1536,7 @@ mod tests {
             ca.clone(),
             revocations.clone(),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -1564,6 +1623,7 @@ mod tests {
                     ca.clone(),
                     Arc::new(RevocationRegistry::new()),
                     Arc::new(PgEpochs::new(pool)),
+                    None, // no NetBox inventory sink in this test
                     cmd_rx,
                 )
                 .unwrap();
@@ -1624,6 +1684,54 @@ mod tests {
             a.derive(&bpub, b"bind").unwrap(),
             b.derive(&apub, b"bind").unwrap(),
         )
+    }
+
+    #[test]
+    fn decode_inventory_opens_a_sealed_snapshot_and_drops_garbage() {
+        use osa_core::seal::Direction;
+
+        let (coord_keys, agent_keys) = session_keys_pair();
+        let host = HostId::new();
+        let mut sessions = SessionStore::new();
+        sessions.insert(host, "s".into(), coord_keys);
+        let tenant = osa_core::topics::tenant(&host.0.to_string());
+
+        let inv = Inventory {
+            dmi_serial: Some("SN-9".into()),
+            system: None,
+            interfaces: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let sealed = osa_core::wire::seal_envelope(
+            &agent_keys,
+            Direction::AgentToCoord,
+            &host.0.to_string(),
+            "s",
+            0,
+            Kind::Control,
+            &osa_core::wire::encode(&inv),
+        );
+        let payload = osa_core::wire::encode(&sealed);
+
+        // Garbage and a wrong/unknown tenant drop before touching the session.
+        assert!(decode_inventory(&tenant, b"not a protobuf", &mut sessions).is_none());
+        assert!(decode_inventory("not-a-uuid", &payload, &mut sessions).is_none());
+        let mut empty = SessionStore::new();
+        assert!(
+            decode_inventory(&tenant, &payload, &mut empty).is_none(),
+            "an inventory for a host with no live session drops"
+        );
+
+        // A valid sealed snapshot opens to (host, inventory).
+        let (got_host, got) = decode_inventory(&tenant, &payload, &mut sessions).unwrap();
+        assert_eq!(got_host, host);
+        assert_eq!(got.dmi_serial.as_deref(), Some("SN-9"));
+
+        // The same envelope again is a replay (seq 0 ≤ high-water) — dropped.
+        assert!(
+            decode_inventory(&tenant, &payload, &mut sessions).is_none(),
+            "a replayed inventory envelope is rejected by the session seq guard"
+        );
     }
 
     #[test]
@@ -1963,6 +2071,7 @@ mod tests {
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -2248,6 +2357,7 @@ mod tests {
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -2363,6 +2473,7 @@ mod tests {
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();
@@ -2490,6 +2601,7 @@ mod tests {
             ca.clone(),
             Arc::new(crate::revocation::RevocationRegistry::new()),
             Arc::new(crate::epoch::EpochRegistry::new()),
+            None, // no NetBox inventory sink in this test
             cmd_rx,
         )
         .unwrap();

@@ -101,6 +101,40 @@ message StreamFrame {
   bool eof = 2;
 }
 
+// Agent-observed host inventory (AD-15/AD-16): collected agent-side (story 5.1)
+// and shipped up for the coordinator's NetBox `InventorySink` (5.2/5.3). The DMI
+// serial is the NetBox match key; it is OPTIONAL because a host may expose none
+// (a VM/container, or a root-only sysfs) — the sink refuses to match on an absent
+// serial rather than clobbering the wrong device.
+message Inventory {
+  optional string dmi_serial = 1;
+  InventorySystem system = 2;
+  repeated InventoryInterface interfaces = 3;
+  repeated InventoryGap gaps = 4; // facts collection could not obtain (observability)
+}
+
+// Core system facts of an [Inventory].
+message InventorySystem {
+  string hostname = 1;
+  string os = 2;           // human-readable OS, e.g. "Ubuntu 22.04.3 LTS"
+  string kernel = 3;
+  uint64 cpu_count = 4;    // logical CPUs
+  uint64 memory_bytes = 5; // total physical memory
+}
+
+// One network interface of an [Inventory].
+message InventoryInterface {
+  string name = 1;
+  string mac = 2;
+  repeated string ip_addresses = 3;
+}
+
+// A fact collection could not obtain — reported for observability, never fatal.
+message InventoryGap {
+  string field = 1;  // e.g. "dmi_serial"
+  string reason = 2;
+}
+
 // Agent → coordinator, **sealed** on `…/up/result` (#20, Epic 3). A job streams
 // many `OutputChunk`s in order followed by exactly one terminal `JobOutcome`.
 message JobResult {

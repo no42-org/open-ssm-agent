@@ -49,6 +49,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "uuid"] }
 # Hash join tokens before storing them in Postgres (never store the secret).
 sha2 = "0.10"
+# NetBox CMDB client (AD-16/AD-17): reqwest with rustls-tls, no OpenSSL. Sets the
+# project MSRV floor (Rust >= 1.91); the AD-16 upsert rules layer on top of it.
+netbox = "0.6"
+# PATCH bodies for the field-scoped NetBox device update (custom_fields).
+serde_json = "1"
 
 [dev-dependencies]
 # Mint operator JWTs in the interceptor + auth-boundary tests (same crate osa-core
