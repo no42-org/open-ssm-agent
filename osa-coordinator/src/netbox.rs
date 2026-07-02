@@ -8,9 +8,10 @@
 //! The coordinator holds the single NetBox write-credential (no host ever does,
 //! AD-17) and reconciles each host's observed [`Inventory`] into NetBox. This
 //! module owns the **AD-16 decision logic**, kept behind a small [`NetboxDevices`]
-//! seam so it is unit-tested against a fake without a live NetBox. The real
-//! `netbox`-crate adapter ([`NetboxClient`]) has no fast-gate coverage; its
-//! against-a-live-NetBox `#[ignore]` testcontainer test is a follow-up (5.2a.2).
+//! seam so it is unit-tested against a fake in the fast gate. The real
+//! `netbox`-crate adapter ([`NetboxClient`]) is exercised end-to-end against a live
+//! NetBox by the `#[ignore]` testcontainer test below (run via `make test-netbox`
+//! / the netbox-integration CI job), off the fast gate.
 //!
 //! Story 5.2a is the safe core: **match on the DMI serial** and field-scoped
 //! update — stamping the host_id onto a NetBox custom field, never touching a
@@ -20,11 +21,14 @@
 //! creation, interfaces/IPs, the Device-vs-VM branch, content-hash dedup and
 //! transient-error retry/queue are story 5.2b.
 //!
-//! # Deployment precondition
-//! NetBox 4.x rejects a PATCH to an unregistered custom-field key with HTTP 400,
-//! so a text custom field named [`CF_HOST_ID`] bound to `dcim.device` MUST exist
-//! or every stamp fails. [`NetboxClient::preflight`] warns at startup when it is
-//! absent; see the README.
+//! # Deployment preconditions
+//! - A text custom field named [`CF_HOST_ID`] bound to `dcim.device` MUST exist,
+//!   or NetBox rejects every stamp PATCH with HTTP 400.
+//!   [`NetboxClient::preflight`] warns at startup when it is absent.
+//! - The `--netbox-token` MUST be a **V1** API token: this crate authenticates
+//!   with `Authorization: Token <key>`, while NetBox 4.5 defaults to V2 (Bearer)
+//!   tokens (which also require `API_TOKEN_PEPPERS`). Create a V1 token for the
+//!   coordinator. See the README.
 //!
 //! # Known gaps (5.2b)
 //! - Two hosts observing the **same** device (a cloned/duplicated serial) currently
@@ -340,6 +344,273 @@ mod tests {
         assert!(
             sink.devices.stamps().is_empty(),
             "a count>1 match must never write (AD-16)"
+        );
+    }
+}
+
+/// Real-NetBox integration test (5.2a.2). Boots NetBox + Postgres + Redis on a
+/// shared docker network, provisions the schema (the `osa_host_id` custom field
+/// and one device with a known serial), then drives the **real** [`NetboxClient`]
+/// end to end. `#[ignore]`d because NetBox is a multi-container ~2-3 min boot —
+/// run it via the dedicated `make test-netbox` CI job, not the fast gate.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use std::time::Duration;
+
+    use osa_core::ports::InventorySink;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::redis::Redis;
+    use testcontainers_modules::testcontainers::core::{ExecCommand, IntoContainerPort};
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{GenericImage, ImageExt};
+
+    // Hermetic test credentials (throwaway; never used outside this test). NetBox
+    // 4.5 defaults to V2 (Bearer) tokens, but the `netbox` crate authenticates with
+    // V1 `Token <key>`, so we create a V1 token (V1 needs no API_TOKEN_PEPPERS) —
+    // the realistic deployment shape for this client.
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SECRET_KEY: &str = "test-secret-key-please-ignore-0123456789abcdefghij";
+    const SERIAL: &str = "OSA-IT-SERIAL-1";
+    const NETBOX_IMAGE: &str = "netboxcommunity/netbox";
+    const NETBOX_TAG: &str = "v4.5";
+
+    /// Poll NetBox's login page until it serves (200) or a deadline passes — our
+    /// own readiness wait, since the image has no healthcheck and we avoid the
+    /// `http_wait` feature (and its hickory-dns resolver).
+    async fn wait_until_ready(http: &reqwest::Client, base: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            if let Ok(resp) = http.get(format!("{base}/login/")).send().await
+                && resp.status().is_success()
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "NetBox did not become ready within the deadline"
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    /// POST `body` to `path` and return the created object's `id`.
+    async fn create(
+        http: &reqwest::Client,
+        base: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> i64 {
+        let resp = http
+            .post(format!("{base}{path}"))
+            .header("Authorization", format!("Token {TOKEN}"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert!(status.is_success(), "POST {path} -> {status}: {text}");
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no id in {path} response: {text}"))
+    }
+
+    /// The `osa_host_id` custom field on the device matching `serial`, if any.
+    async fn stamped_host_id(http: &reqwest::Client, base: &str, serial: &str) -> Option<String> {
+        let text = http
+            .get(format!("{base}/api/dcim/devices/?serial={serial}"))
+            .header("Authorization", format!("Token {TOKEN}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["results"][0]["custom_fields"]["osa_host_id"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn inventory(serial: &str) -> Inventory {
+        Inventory {
+            dmi_serial: Some(serial.to_string()),
+            system: None,
+            interfaces: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "real NetBox testcontainer (Postgres+Redis+app, ~2-3 min boot); run via `make test-netbox`"]
+    async fn real_netbox_reconciles_a_matched_device_and_stamps_the_host_id() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let net = format!("osa-netbox-it-{}", uuid::Uuid::new_v4().simple());
+
+        // Postgres + Redis with stable hostnames on a shared network so the NetBox
+        // app container can reach them by name.
+        let _pg = Postgres::default()
+            .with_tag("17-alpine")
+            .with_container_name(format!("pg-{net}"))
+            .with_network(net.clone())
+            .start()
+            .await
+            .unwrap();
+        let _redis = Redis::default()
+            .with_container_name(format!("redis-{net}"))
+            .with_network(net.clone())
+            .start()
+            .await
+            .unwrap();
+
+        // The NetBox app: migrate, create the superuser + API token, serve on 8080.
+        // No wait strategy here (the image ships no healthcheck and we avoid the
+        // http_wait feature); readiness is polled below with our own reqwest.
+        let netbox = GenericImage::new(NETBOX_IMAGE, NETBOX_TAG)
+            .with_exposed_port(8080.tcp())
+            .with_network(net.clone())
+            .with_startup_timeout(Duration::from_secs(360))
+            .with_env_var("DB_HOST", format!("pg-{net}"))
+            .with_env_var("DB_NAME", "postgres")
+            .with_env_var("DB_USER", "postgres")
+            .with_env_var("DB_PASSWORD", "postgres")
+            .with_env_var("REDIS_HOST", format!("redis-{net}"))
+            .with_env_var("REDIS_PORT", "6379")
+            .with_env_var("REDIS_DATABASE", "0")
+            .with_env_var("REDIS_SSL", "false")
+            .with_env_var("REDIS_CACHE_HOST", format!("redis-{net}"))
+            .with_env_var("REDIS_CACHE_PORT", "6379")
+            .with_env_var("REDIS_CACHE_DATABASE", "1")
+            .with_env_var("REDIS_CACHE_SSL", "false")
+            .with_env_var("SECRET_KEY", SECRET_KEY)
+            .with_env_var("SKIP_SUPERUSER", "false")
+            .with_env_var("SUPERUSER_NAME", "admin")
+            .with_env_var("SUPERUSER_EMAIL", "admin@example.com")
+            .with_env_var("SUPERUSER_PASSWORD", "adminpassword")
+            .with_env_var("ALLOWED_HOSTS", "*")
+            .start()
+            .await
+            .unwrap();
+
+        let port = netbox.get_host_port_ipv4(8080).await.unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let http = reqwest::Client::new();
+
+        // The image ships no healthcheck, so wait for the app to serve (migrations
+        // + superuser creation done) before creating the token / provisioning.
+        wait_until_ready(&http, &base).await;
+
+        // The entrypoint created the `admin` superuser but no API token (V2 needs
+        // API_TOKEN_PEPPERS). Create a V1 token with our known key for the client.
+        let mut mk_token = netbox
+            .exec(ExecCommand::new([
+                "/opt/netbox/venv/bin/python",
+                "/opt/netbox/netbox/manage.py",
+                "shell",
+                "-c",
+                &format!(
+                    "from users.models import Token, User; \
+                     from users.choices import TokenVersionChoices; \
+                     u = User.objects.get(username='admin'); \
+                     Token.objects.create(user=u, token='{TOKEN}', version=TokenVersionChoices.V1)"
+                ),
+            ]))
+            .await
+            .unwrap();
+        let token_stderr = mk_token.stderr_to_vec().await.unwrap();
+        assert_eq!(
+            mk_token.exit_code().await.unwrap(),
+            Some(0),
+            "creating the V1 API token failed: {}",
+            String::from_utf8_lossy(&token_stderr)
+        );
+
+        // Provision: the osa_host_id custom field on dcim.device, and one device
+        // (which needs a site, a manufacturer→device-type, and a role) with SERIAL.
+        create(
+            &http,
+            &base,
+            "/api/extras/custom-fields/",
+            serde_json::json!({
+                "object_types": ["dcim.device"],
+                "name": CF_HOST_ID,
+                "type": "text",
+                "label": "OSA Host ID",
+            }),
+        )
+        .await;
+        let site = create(
+            &http,
+            &base,
+            "/api/dcim/sites/",
+            serde_json::json!({"name": "IT", "slug": "it"}),
+        )
+        .await;
+        let mfr = create(
+            &http,
+            &base,
+            "/api/dcim/manufacturers/",
+            serde_json::json!({"name": "OSA", "slug": "osa"}),
+        )
+        .await;
+        let device_type = create(
+            &http,
+            &base,
+            "/api/dcim/device-types/",
+            serde_json::json!({"manufacturer": mfr, "model": "OSA-Box", "slug": "osa-box"}),
+        )
+        .await;
+        let role = create(
+            &http,
+            &base,
+            "/api/dcim/device-roles/",
+            serde_json::json!({"name": "server", "slug": "server", "color": "9e9e9e"}),
+        )
+        .await;
+        create(
+            &http,
+            &base,
+            "/api/dcim/devices/",
+            serde_json::json!({
+                "name": "host-1",
+                "device_type": device_type,
+                "role": role,
+                "site": site,
+                "serial": SERIAL,
+                "status": "active",
+            }),
+        )
+        .await;
+
+        // Drive the REAL client end to end.
+        let client = NetboxClient::new(&NetboxConfig {
+            url: base.clone(),
+            token: TOKEN.to_string(),
+        })
+        .unwrap();
+        client.preflight().await; // exercises extras().custom_fields().list
+        let host = HostId::new();
+        let sink = NetboxInventorySink::new(client);
+
+        // An unknown serial matches nothing.
+        assert_eq!(
+            sink.upsert(host, &inventory("NO-SUCH-SERIAL"))
+                .await
+                .unwrap(),
+            UpsertOutcome::Unmatched
+        );
+        // The known serial matches exactly one device and is field-scope-stamped.
+        assert_eq!(
+            sink.upsert(host, &inventory(SERIAL)).await.unwrap(),
+            UpsertOutcome::Updated
+        );
+        // The stamp actually landed on the device's custom field.
+        assert_eq!(
+            stamped_host_id(&http, &base, SERIAL).await.as_deref(),
+            Some(host.0.to_string().as_str()),
+            "the host_id must be written to the device's osa_host_id custom field"
         );
     }
 }
