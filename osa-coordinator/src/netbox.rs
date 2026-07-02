@@ -23,13 +23,14 @@
 //!
 //! A **transient** NetBox failure is retried with backoff (5.2b-2a) so a blip
 //! doesn't lose the snapshot; a permanent error (a 4xx → [`PortError::Invalid`])
-//! fails fast.
+//! fails fast. A device already claimed by a **different** host_id (a cloned or
+//! duplicated serial) is a [`UpsertOutcome::HostCollision`]: alert, write nothing
+//! (5.2b-2b) — never steal the record.
 //!
 //! Deferred to 5.2b-2:
 //! - record **creation** (count==0, with the Device-vs-VM branch + operator-
-//!   configured defaults for the required human-curated fields),
-//! - MAC sync (NetBox 4.2+ `MACAddress` objects), and
-//! - the two-hosts-per-device alert.
+//!   configured defaults for the required human-curated fields), and
+//! - MAC sync (NetBox 4.2+ `MACAddress` objects).
 //!
 //! # Deployment preconditions
 //! - A text custom field named [`CF_HOST_ID`] bound to `dcim.device` MUST exist,
@@ -40,10 +41,7 @@
 //!   tokens (which also require `API_TOKEN_PEPPERS`). Create a V1 token for the
 //!   coordinator. See the README.
 //!
-//! # Known gaps (5.2b)
-//! - Two hosts observing the **same** device (a cloned/duplicated serial) currently
-//!   last-writer-wins the stamp with no alert — the "never guess which host" rule is
-//!   only half-enforced until the duplicate-serial (Device-vs-VM) handling lands.
+//! # Known gaps
 //! - AD-16 prefers `Bearer` auth; the `netbox` crate hardcodes `Token` (NetBox
 //!   accepts both), so the preference is currently unmet.
 
@@ -72,17 +70,19 @@ fn is_transient(e: &PortError) -> bool {
     matches!(e, PortError::Backend(_) | PortError::Transport(_))
 }
 
-/// A NetBox device the sink matched — its id is enough to field-scope-update it.
-/// Ids are `i64` (NetBox uses `BigAutoField`); the seam never truncates them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A NetBox device the sink matched. Ids are `i64` (NetBox uses `BigAutoField`);
+/// the seam never truncates them. `host_id` is the device's current `osa_host_id`
+/// custom field (already fetched by the match) — used to detect a host collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRef {
     pub id: i64,
+    pub host_id: Option<String>,
 }
 
 /// How many devices matched a DMI serial — the **authoritative total** (from
 /// NetBox's paginated `count`, not a page slice), so the AD-16 `count>1` rule is
 /// decided correctly even when the true count exceeds one page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SerialMatch {
     /// No device matches the serial.
     None,
@@ -291,6 +291,23 @@ impl<D: NetboxDevices> NetboxInventorySink<D> {
         match self.devices.match_by_serial(serial).await? {
             SerialMatch::None => Ok(UpsertOutcome::Unmatched),
             SerialMatch::One(device) => {
+                // AD-16: never guess which host. If the device is already claimed by
+                // a DIFFERENT host_id (a cloned/duplicated serial), alert and write
+                // nothing rather than stealing it. An empty/matching stamp proceeds.
+                let ours = host_id.0.to_string();
+                if device
+                    .host_id
+                    .as_deref()
+                    .is_some_and(|h| !h.is_empty() && h != ours)
+                {
+                    tracing::error!(
+                        serial,
+                        host = %host_id.0,
+                        claimed_by = %device.host_id.as_deref().unwrap_or(""),
+                        "NetBox: device already claimed by a different host — refusing to overwrite (AD-16)"
+                    );
+                    return Ok(UpsertOutcome::HostCollision);
+                }
                 self.reconcile(device.id, host_id, observed).await?;
                 Ok(UpsertOutcome::Updated)
             }
@@ -489,7 +506,19 @@ impl NetboxDevices for NetboxClient {
                 let id = device
                     .id
                     .ok_or_else(|| PortError::Backend("NetBox device has no id".into()))?;
-                Ok(SerialMatch::One(DeviceRef { id: i64::from(id) }))
+                // The device's current osa_host_id custom field (fetched with the
+                // match) — for the host-collision check.
+                let host_id = device
+                    .custom_fields
+                    .as_ref()
+                    .and_then(|cf| cf.get(CF_HOST_ID))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                Ok(SerialMatch::One(DeviceRef {
+                    id: i64::from(id),
+                    host_id,
+                }))
             }
             count => Ok(SerialMatch::Many(count)),
         }
@@ -663,6 +692,7 @@ mod tests {
     #[derive(Default)]
     struct FakeState {
         interfaces: HashMap<i64, Vec<NbInterface>>, // device_id -> interfaces
+        host_ids: HashMap<i64, String>,             // device_id -> stamped osa_host_id
         next_id: i64,
         finalized: Vec<Finalize>,
         // Failure injection for the retry tests.
@@ -690,6 +720,15 @@ mod tests {
         }
         fn with_permanent_failure(self) -> Self {
             self.state.lock().unwrap().permanent_failure = true;
+            self
+        }
+        /// Seed the device as already claimed by `host_id` (for the collision test).
+        fn claimed_by(self, device_id: i64, host_id: &str) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .host_ids
+                .insert(device_id, host_id.to_string());
             self
         }
         fn match_attempts(&self) -> u32 {
@@ -747,9 +786,13 @@ mod tests {
                     return Err(PortError::Backend("transient".into()));
                 }
             }
+            let s = self.state.lock().unwrap();
             Ok(match self.by_serial.get(serial).map(Vec::as_slice) {
                 None | Some([]) => SerialMatch::None,
-                Some([id]) => SerialMatch::One(DeviceRef { id: *id }),
+                Some([id]) => SerialMatch::One(DeviceRef {
+                    id: *id,
+                    host_id: s.host_ids.get(id).cloned(),
+                }),
                 Some(many) => SerialMatch::Many(many.len()),
             })
         }
@@ -826,12 +869,10 @@ mod tests {
             primary_ip6: Option<i64>,
             host_id: &str,
         ) -> Result<(), PortError> {
-            self.state.lock().unwrap().finalized.push((
-                device_id,
-                primary_ip4,
-                primary_ip6,
-                host_id.to_string(),
-            ));
+            let mut s = self.state.lock().unwrap();
+            s.host_ids.insert(device_id, host_id.to_string());
+            s.finalized
+                .push((device_id, primary_ip4, primary_ip6, host_id.to_string()));
             Ok(())
         }
     }
@@ -1130,6 +1171,40 @@ mod tests {
             sink.devices.match_attempts(),
             1,
             "a permanent error fails fast, no retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_claimed_by_another_host_is_a_collision_and_writes_nothing() {
+        let host = HostId::new();
+        // Device 7 is already stamped with a DIFFERENT host_id.
+        let sink = NetboxInventorySink::new(
+            FakeDevices::matching("SN", &[7]).claimed_by(7, "11111111-2222-4333-8444-555555555555"),
+        );
+        assert_eq!(
+            sink.upsert(host, &inventory(Some("SN"), vec![]))
+                .await
+                .unwrap(),
+            UpsertOutcome::HostCollision
+        );
+        assert!(
+            sink.devices.finalized().is_empty(),
+            "a host collision must never write (AD-16)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_reclaiming_its_own_device_proceeds() {
+        let host = HostId::new();
+        // Device 7 is already stamped with THIS host's id — not a collision.
+        let sink = NetboxInventorySink::new(
+            FakeDevices::matching("SN", &[7]).claimed_by(7, &host.0.to_string()),
+        );
+        assert_eq!(
+            sink.upsert(host, &inventory(Some("SN"), vec![]))
+                .await
+                .unwrap(),
+            UpsertOutcome::Updated
         );
     }
 }
@@ -1503,6 +1578,30 @@ mod integration {
         assert!(
             device["results"][0]["primary_ip4"].is_null(),
             "primary_ip4 was cleared"
+        );
+
+        // A DIFFERENT host reporting the same serial is a collision: the device is
+        // already claimed (osa_host_id == the first host), so the sink alerts and
+        // writes nothing. This proves the real match reads osa_host_id.
+        let other = HostId::new();
+        let sink4 = NetboxInventorySink::new(
+            NetboxClient::new(&NetboxConfig {
+                url: base.clone(),
+                token: TOKEN.to_string(),
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            sink4
+                .upsert(other, &inventory(SERIAL, vec![]))
+                .await
+                .unwrap(),
+            UpsertOutcome::HostCollision
+        );
+        assert_eq!(
+            stamped_host_id(&http, &base, SERIAL).await.as_deref(),
+            Some(host.0.to_string().as_str()),
+            "the collision left the original host_id untouched"
         );
     }
 }
