@@ -1,0 +1,52 @@
+# Copyright 2026 Ronny Trommer <ronny@no42.org>
+# SPDX-License-Identifier: MIT
+#
+# The real-NetBox InventorySink integration test (5.2a.2): boots NetBox +
+# Postgres + Redis via testcontainers and drives the live NetboxClient. It is
+# #[ignore]d out of the normal gate (a multi-container ~2-3 min boot), so it runs
+# in this dedicated job — path-filtered to NetBox-touching changes so unrelated
+# PRs are not taxed. GitHub's ubuntu runners ship Docker, which testcontainers uses.
+
+name: NetBox Integration
+
+on:
+  push:
+    branches: [main]
+    paths: &netbox_paths
+      - osa-coordinator/src/netbox.rs
+      - osa-coordinator/Cargo.toml
+      - osa-core/src/ports.rs
+      - osa-proto/proto/osa.proto
+      - Makefile
+      - .github/workflows/netbox-integration.yml
+  pull_request:
+    paths: *netbox_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netbox-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netbox-integration:
+    name: netbox-integration (testcontainers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # osa-proto codegen shells out to protoc (AD-6); it is a hard build dep.
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Real-NetBox integration test
+        run: make test-netbox

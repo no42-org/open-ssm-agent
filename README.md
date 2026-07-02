@@ -55,13 +55,18 @@ When the coordinator is started with `--netbox-url` and `--netbox-token`
 reconciled into NetBox (AD-16/AD-17). The coordinator holds the **only** NetBox
 write credential — no host ever does.
 
-**Deployment precondition:** create a text custom field named `osa_host_id` bound
-to the `dcim.device` object type in NetBox before enabling the sink. NetBox
-rejects a write to an unregistered custom field with HTTP 400, so without it every
-inventory stamp fails; the coordinator logs a loud warning at startup when the
-field is absent. Devices are matched on their DMI serial and only the agent's
-`host_id` is written — human-curated fields (site, rack, role, tenant,
-description) are never touched.
+**Deployment preconditions:**
+
+- Create a text custom field named `osa_host_id` bound to the `dcim.device` object
+  type before enabling the sink. NetBox rejects a write to an unregistered custom
+  field with HTTP 400, so without it every inventory stamp fails; the coordinator
+  logs a loud warning at startup when the field is absent.
+- `--netbox-token` must be a **V1** API token. The coordinator authenticates with
+  `Authorization: Token <key>`, whereas NetBox 4.5 defaults to V2 (Bearer) tokens.
+  Create a V1 token for the coordinator's account.
+
+Devices are matched on their DMI serial and only the agent's `host_id` is written
+— human-curated fields (site, rack, role, tenant, description) are never touched.
 
 ## Contract
 

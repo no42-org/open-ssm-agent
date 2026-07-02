@@ -20,7 +20,7 @@ LINUX_RUST_IMAGE ?= rust:1-bookworm
 TYPOS_VERSION ?= 1.47.2
 
 .PHONY: all build verify verify-ci fmt fmt-check lint lint-linux \
-        typos machete deny coverage test clean
+        typos machete deny coverage test test-netbox clean
 
 all: build
 
@@ -75,6 +75,12 @@ coverage:
 
 test:
 	$(CARGO) test --workspace
+
+# Real-NetBox integration test (5.2a.2): boots NetBox + Postgres + Redis (~2-3 min
+# per run). #[ignore]d out of the normal gate; run here and in the dedicated
+# netbox-integration CI job, not the fast inner loop. Needs Docker.
+test-netbox:
+	$(CARGO) test -p osa-coordinator --bin osa-coordinator -- --ignored real_netbox
 
 # Fast inner loop (host-native): format, clippy, test.
 verify: fmt-check lint test
