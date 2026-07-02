@@ -33,6 +33,7 @@ mod ca;
 mod db;
 mod epoch;
 mod jwks;
+mod netbox;
 mod policy;
 mod revocation;
 mod service;
@@ -119,6 +120,17 @@ struct Cli {
     /// coordinator is stateless across replicas. Absent → in-memory single-node.
     #[arg(long, env = "OSA_DATABASE_URL")]
     database_url: Option<String>,
+
+    /// NetBox base URL for the inventory sink (AD-16/AD-17). When set (with
+    /// `--netbox-token`), agent-reported inventory is reconciled into NetBox;
+    /// absent → inventory is ignored. The coordinator holds the ONLY write
+    /// credential — no host ever does.
+    #[arg(long, env = "OSA_NETBOX_URL")]
+    netbox_url: Option<String>,
+
+    /// NetBox API token for the inventory sink. Required with `--netbox-url`.
+    #[arg(long, env = "OSA_NETBOX_TOKEN")]
+    netbox_token: Option<String>,
 }
 
 #[tokio::main]
@@ -204,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
         &server_cert.key_pem,
     )?;
     std::fs::write(cert_dir.path().join(broker::CA_CERT), ca.ca_root_pem())?;
+    // The NetBox inventory sink (AD-16/AD-17): the coordinator holds the single
+    // write credential. Configured → agent-reported inventory is reconciled into
+    // NetBox; absent → inventory is ignored. The bridge upserts through it.
+    let inventory_sink = build_inventory_sink(&cli).await?;
+
     // The operator service hands dispatches to the bridge over this channel; the
     // bridge seals them to host sessions and streams results back (Epic 3).
     let (bridge_tx, bridge_rx) = tokio::sync::mpsc::channel(BRIDGE_COMMAND_QUEUE);
@@ -213,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         ca.clone(),
         revocations.clone(),
         epochs,
+        inventory_sink,
         bridge_rx,
     )?;
     wait_until_listening(mqtt_addr).await?;
@@ -270,6 +288,39 @@ fn build_router(
         None => server
             .add_service(OperatorServer::new(operator))
             .add_service(enrollment),
+    }
+}
+
+/// Build the NetBox inventory sink (AD-16/AD-17) if configured. `--netbox-url` +
+/// `--netbox-token` must be set together; neither → no sink (inventory ignored),
+/// one without the other is a hard misconfiguration, never a silent fallback.
+async fn build_inventory_sink(
+    cli: &Cli,
+) -> anyhow::Result<Option<Arc<dyn osa_core::ports::InventorySink>>> {
+    match (&cli.netbox_url, &cli.netbox_token) {
+        (Some(url), Some(token)) => {
+            anyhow::ensure!(
+                !url.trim().is_empty() && !token.trim().is_empty(),
+                "--netbox-url and --netbox-token must be non-empty"
+            );
+            let config = netbox::NetboxConfig {
+                url: url.clone(),
+                token: token.clone(),
+            };
+            let client = netbox::NetboxClient::new(&config)?;
+            // Warn early if the osa_host_id custom field is missing (else every
+            // stamp 400s); non-blocking so the coordinator still serves the rest.
+            client.preflight().await;
+            tracing::info!(%url, "NetBox inventory sink configured (AD-17)");
+            Ok(Some(Arc::new(netbox::NetboxInventorySink::new(client))))
+        }
+        (None, None) => {
+            tracing::info!(
+                "no --netbox-url — agent-reported inventory is ignored (no NetBox sink)"
+            );
+            Ok(None)
+        }
+        _ => anyhow::bail!("--netbox-url and --netbox-token must be set together"),
     }
 }
 

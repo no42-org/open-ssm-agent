@@ -48,6 +48,21 @@ Requires Rust ≥ 1.91 (MSRV floor) and `protoc` for `osa-proto` codegen.
 on macOS/Windows skips it, so this is what stops a Linux-only lint from passing
 locally and failing CI. `make verify` stays host-native for a fast inner loop.
 
+## NetBox inventory sink
+
+When the coordinator is started with `--netbox-url` and `--netbox-token`
+(env `OSA_NETBOX_URL` / `OSA_NETBOX_TOKEN`), agent-reported inventory is
+reconciled into NetBox (AD-16/AD-17). The coordinator holds the **only** NetBox
+write credential — no host ever does.
+
+**Deployment precondition:** create a text custom field named `osa_host_id` bound
+to the `dcim.device` object type in NetBox before enabling the sink. NetBox
+rejects a write to an unregistered custom field with HTTP 400, so without it every
+inventory stamp fails; the coordinator logs a loud warning at startup when the
+field is absent. Devices are matched on their DMI serial and only the agent's
+`host_id` is written — human-curated fields (site, rack, role, tenant,
+description) are never touched.
+
 ## Contract
 
 Source comments cite a preservation-validated `SPEC.md` and the architecture

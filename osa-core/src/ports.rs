@@ -10,7 +10,7 @@
 //! bin can hold them behind `dyn`.
 
 use async_trait::async_trait;
-use osa_proto::v1::{ActionDescriptor, Envelope};
+use osa_proto::v1::{ActionDescriptor, Envelope, Inventory};
 
 use crate::audit::{AuditEntry, AuditRecord};
 use crate::domain::HostId;
@@ -95,11 +95,32 @@ pub trait CertIssuer: Send + Sync {
     async fn sign(&self, host_id: HostId, csr: &[u8]) -> Result<Vec<u8>, PortError>;
 }
 
+/// What an [`InventorySink::upsert`] did — enough for the caller to log and act
+/// without the sink leaking CMDB internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertOutcome {
+    /// The single matched record was updated with the observed, field-scoped facts.
+    Updated,
+    /// No record matched the DMI serial (record creation is a later slice).
+    Unmatched,
+    /// The snapshot carried no usable DMI serial, so no match was attempted —
+    /// AD-16 never matches on an absent serial (that would risk the wrong device).
+    SkippedNoSerial,
+    /// More than one record matched the DMI serial: ambiguous, so the sink raised
+    /// an alert and wrote **nothing** (AD-16: `count>1` → alert, never blind-write).
+    AmbiguousMatch { count: usize },
+}
+
 /// CMDB sink (AD-16, AD-17). Coordinator-side only — no host holds a write
 /// token. One-way, field-scoped upsert matched on DMI serial; never touches
 /// human-curated fields.
 #[async_trait]
 pub trait InventorySink: Send + Sync {
-    /// Idempotently upsert one host's observed inventory snapshot.
-    async fn upsert(&self, host_id: HostId, observed: &[u8]) -> Result<(), PortError>;
+    /// Idempotently reconcile one host's observed inventory snapshot into the
+    /// CMDB, matching on the DMI serial and writing only agent-observed fields.
+    async fn upsert(
+        &self,
+        host_id: HostId,
+        observed: &Inventory,
+    ) -> Result<UpsertOutcome, PortError>;
 }
