@@ -68,6 +68,6 @@ serde.workspace = true
 # `testcontainers` crate (GenericImage/ExecCommand/…) — the NetBox app readiness
 # is polled with the workspace's own reqwest, avoiding the `http_wait` feature
 # (its reqwest hickory-dns resolver would drag a dev-only RUSTSEC advisory in).
-testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 # An mTLS MQTT client to prove the broker's per-host topic isolation (#16).
 rumqttc = "0.25.1"
