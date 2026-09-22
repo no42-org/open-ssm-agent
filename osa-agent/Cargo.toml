@@ -31,7 +31,7 @@ uuid.workspace = true
 # PTY (`term`), start a new session (`process`), set the master non-blocking
 # (`fcntl`, under the `fs` feature) for the interactive-shell StreamCapability
 # (Epic 4).
-nix = { version = "0.29", default-features = false, features = ["user", "term", "process", "fs"] }
+nix = { version = "0.31", default-features = false, features = ["user", "term", "process", "fs"] }
 # Raw read/write/ioctl on the PTY master fd (TIOCSCTTY/TIOCSWINSZ, EIO→EOF).
 libc = "0.2"
 serde.workspace = true
