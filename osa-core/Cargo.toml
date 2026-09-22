@@ -16,7 +16,7 @@ thiserror.workspace = true
 uuid.workspace = true
 serde.workspace = true
 aes-gcm = "0.10.3"
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 # ECDSA P-256 (the identity-key algorithm) to authenticate the session handshake
